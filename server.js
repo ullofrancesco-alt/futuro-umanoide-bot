@@ -3,15 +3,20 @@ const TelegramBot = require('node-telegram-bot-api');
 const axios = require('axios');
 
 // ============================================
-// CONFIGURAZIONE - DATI REALI
+// CONFIGURAZIONE - USA VARIABILI D'AMBIENTE
 // ============================================
-const TELEGRAM_TOKEN = '8239600520:AAHMVAEsUu3Hdd4vD4KFH4KW48a-Q5WBsqY';
-const ADMIN_CHAT_ID = '585681146';
+const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN || '8239600520:AAHMVAEsUu3Hdd4vD4KFH4KW48a-Q5WBsqY';
+const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID || '585681146';
 
-// Base44 API - I TUOI DATI REALI
-const BASE44_API = 'https://app.base44.com/api/apps/690e1a0262a871b277571301/entities';
-const BASE44_API_KEY = '601a9651d7f9433d92341d73eb30398b';
-const BASE44_APP_ID = '690e1a0262a871b277571301';
+// Base44 API
+const BASE44_API = process.env.BASE44_API || 'https://app.base44.com/api/apps/690e1a0262a871b277571301/entities';
+const BASE44_API_KEY = process.env.BASE44_API_KEY || '601a9651d7f9433d92341d73eb30398b';
+const BASE44_APP_ID = process.env.BASE44_APP_ID || '690e1a0262a871b277571301';
+
+// Vault & PolygonScan
+const VAULT_ADDRESS = process.env.VAULT_ADDRESS || '0x78cFdE6e71Cf5cED4afFce5578D2223b51907a49';
+const ROBOT_TOKEN_ADDRESS = '0xb0d2A7b1F1EC7D39409E1D671473020d20547B55';
+const POLYGONSCAN_API_KEY = process.env.POLYGONSCAN_API_KEY || 'YourPolygonScanAPIKey'; // Get free at polygonscan.com
 
 const CHECK_INTERVAL = 30000; // 30 secondi
 
@@ -20,14 +25,205 @@ const CHECK_INTERVAL = 30000; // 30 secondi
 // ============================================
 const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
 const app = express();
-const notifiedRequests = new Set();
+const processedTransactions = new Set(); // Cache transazioni già processate
 
 // ============================================
-// FUNZIONE PRINCIPALE: Controlla Richieste Pending
+// FUNZIONE: Monitora Depositi al Vault
+// ============================================
+async function checkVaultDeposits() {
+  try {
+    console.log('🔍 Controllo depositi al vault...');
+    
+    // Leggi transazioni token in arrivo al vault
+    const response = await axios.get('https://api.polygonscan.com/api', {
+      params: {
+        module: 'account',
+        action: 'tokentx',
+        contractaddress: ROBOT_TOKEN_ADDRESS,
+        address: VAULT_ADDRESS,
+        page: 1,
+        offset: 100,
+        sort: 'desc',
+        apikey: POLYGONSCAN_API_KEY
+      }
+    });
+
+    if (response.data.status !== '1') {
+      console.log('⚠️ Errore PolygonScan API:', response.data.message);
+      return;
+    }
+
+    const transactions = response.data.result;
+
+    // Filtra transazioni recenti (ultima ora) e in arrivo al vault
+    const recentTxs = transactions.filter(tx => {
+      const txTime = parseInt(tx.timeStamp);
+      const oneHourAgo = Date.now() / 1000 - 3600;
+      return txTime > oneHourAgo && tx.to.toLowerCase() === VAULT_ADDRESS.toLowerCase();
+    });
+
+    console.log(`📊 Trovate ${recentTxs.length} transazioni recenti al vault`);
+
+    for (const tx of recentTxs) {
+      // Skip se già processata
+      if (processedTransactions.has(tx.hash)) continue;
+
+      const senderAddress = tx.from;
+      const amount = parseInt(tx.value) / 1e18; // Converti da wei
+      const txHash = tx.hash;
+
+      console.log(`💰 Nuova transazione: ${senderAddress} → ${amount} $ROBOT`);
+
+      // Cerca se esiste un utente con questo wallet nel database
+      const userEmail = await findUserByWallet(senderAddress);
+
+      if (userEmail) {
+        // Utente registrato - accredita automaticamente
+        await processAutoDeposit(userEmail, senderAddress, amount, txHash);
+        processedTransactions.add(txHash);
+      } else {
+        // Wallet sconosciuto - notifica admin
+        await bot.sendMessage(ADMIN_CHAT_ID,
+          `⚠️ DEPOSITO DA WALLET SCONOSCIUTO\n\n` +
+          `💰 Importo: ${amount} $ROBOT\n` +
+          `📍 From: ${senderAddress}\n` +
+          `🔗 ${getPolygonScanTxLink(txHash)}\n\n` +
+          `❓ Wallet non associato a nessun utente registrato`
+        );
+        processedTransactions.add(txHash);
+      }
+    }
+
+  } catch (error) {
+    console.error('❌ Errore controllo vault:', error.message);
+  }
+}
+
+// ============================================
+// FUNZIONE: Trova Utente per Wallet
+// ============================================
+async function findUserByWallet(walletAddress) {
+  try {
+    // Cerca nelle richieste deposito per associare wallet → email
+    const response = await axios.get(`${BASE44_API}/DepositRequest`, {
+      headers: {
+        'api_key': BASE44_API_KEY,
+        'Content-Type': 'application/json'
+      }
+    });
+
+    const requests = response.data;
+    const matchingRequest = requests.find(r => 
+      r.wallet_address && 
+      r.wallet_address.toLowerCase() === walletAddress.toLowerCase()
+    );
+
+    return matchingRequest ? matchingRequest.user_email : null;
+
+  } catch (error) {
+    console.error('Errore ricerca utente:', error.message);
+    return null;
+  }
+}
+
+// ============================================
+// FUNZIONE: Processa Deposito Automatico
+// ============================================
+async function processAutoDeposit(userEmail, walletAddress, amount, txHash) {
+  try {
+    console.log(`✅ Auto-deposito per ${userEmail}: ${amount} $ROBOT`);
+
+    // 1. Leggi balance utente
+    const balanceResponse = await axios.get(`${BASE44_API}/TokenBalance`, {
+      headers: {
+        'api_key': BASE44_API_KEY,
+        'Content-Type': 'application/json'
+      }
+    });
+
+    const balances = balanceResponse.data;
+    const userBalance = balances.find(b => b.user_email === userEmail);
+
+    // 2. Aggiorna o crea balance
+    if (userBalance) {
+      await axios.put(
+        `${BASE44_API}/TokenBalance/${userBalance.id}`,
+        {
+          balance: userBalance.balance + amount,
+          total_deposited: (userBalance.total_deposited || 0) + amount
+        },
+        {
+          headers: {
+            'api_key': BASE44_API_KEY,
+            'Content-Type': 'application/json'
+          }
+        }
+      );
+      console.log(`💰 Balance aggiornato: ${userBalance.balance} → ${userBalance.balance + amount}`);
+    } else {
+      await axios.post(
+        `${BASE44_API}/TokenBalance`,
+        {
+          user_email: userEmail,
+          balance: 1000 + amount, // Bonus iniziale + deposito
+          total_deposited: amount,
+          total_won: 0,
+          total_lost: 0,
+          total_bets: 0
+        },
+        {
+          headers: {
+            'api_key': BASE44_API_KEY,
+            'Content-Type': 'application/json'
+          }
+        }
+      );
+      console.log(`💰 Nuovo balance creato: ${1000 + amount} $ROBOT`);
+    }
+
+    // 3. Crea record deposito approvato
+    await axios.post(
+      `${BASE44_API}/DepositRequest`,
+      {
+        user_email: userEmail,
+        wallet_address: walletAddress,
+        amount: amount,
+        status: 'approved',
+        request_type: 'deposit',
+        admin_notes: `Auto-approvato - TX: ${txHash}`
+      },
+      {
+        headers: {
+          'api_key': BASE44_API_KEY,
+          'Content-Type': 'application/json'
+        }
+      }
+    );
+
+    // 4. Notifica admin su Telegram
+    await bot.sendMessage(ADMIN_CHAT_ID,
+      `✅ DEPOSITO AUTO-APPROVATO\n\n` +
+      `👤 Utente: ${userEmail}\n` +
+      `💰 Importo: ${amount} $ROBOT\n` +
+      `📍 Wallet: ${walletAddress}\n` +
+      `🔗 TX: ${getPolygonScanTxLink(txHash)}\n\n` +
+      `✨ Saldo aggiornato automaticamente!`
+    );
+
+    return true;
+
+  } catch (error) {
+    console.error('❌ Errore auto-deposito:', error.message);
+    return false;
+  }
+}
+
+// ============================================
+// FUNZIONE: Controlla Richieste Prelievo Pending
 // ============================================
 async function checkPendingRequests() {
   try {
-    console.log('🔍 Controllo nuove richieste...');
+    console.log('🔍 Controllo richieste prelievo pending...');
     
     const response = await axios.get(`${BASE44_API}/DepositRequest`, {
       headers: {
@@ -37,38 +233,29 @@ async function checkPendingRequests() {
     });
 
     const allRequests = response.data;
-    const pendingRequests = allRequests.filter(req => req.status === 'pending');
+    const pendingWithdrawals = allRequests.filter(r => 
+      r.status === 'pending' && r.request_type === 'withdrawal'
+    );
 
-    if (pendingRequests && pendingRequests.length > 0) {
-      console.log(`📋 Trovate ${pendingRequests.length} richieste pending`);
+    if (pendingWithdrawals.length > 0) {
+      console.log(`📋 Trovate ${pendingWithdrawals.length} richieste prelievo pending`);
       
-      for (const req of pendingRequests) {
-        if (!notifiedRequests.has(req.id)) {
-          await sendRequestNotification(req);
-          notifiedRequests.add(req.id);
-          console.log(`✅ Notifica inviata per richiesta ${req.id}`);
-        }
+      for (const req of pendingWithdrawals) {
+        await sendWithdrawalNotification(req);
       }
-    } else {
-      console.log('📭 Nessuna richiesta pending');
     }
+
   } catch (error) {
-    console.error('❌ Errore controllo richieste:', error.message);
-    if (error.response) {
-      console.error('Response status:', error.response.status);
-      console.error('Response data:', error.response.data);
-    }
+    console.error('❌ Errore controllo prelievi:', error.message);
   }
 }
 
 // ============================================
-// INVIA NOTIFICA TELEGRAM CON BOTTONI
+// INVIA NOTIFICA PRELIEVO
 // ============================================
-async function sendRequestNotification(request) {
-  const type = request.request_type === 'deposit' ? 'DEPOSITO ⬇️' : 'PRELIEVO ⬆️';
-  
+async function sendWithdrawalNotification(request) {
   const message = `
-🔔 NUOVA RICHIESTA ${type}
+🔔 RICHIESTA PRELIEVO ⬆️
 
 👤 Utente: ${request.user_email}
 💰 Importo: ${request.amount} $ROBOT
@@ -87,8 +274,7 @@ async function sendRequestNotification(request) {
     ]
   };
 
-  // Aggiungi bottone PolygonScan solo se c'è wallet address
-  if (request.wallet_address && request.wallet_address !== 'N/A') {
+  if (request.wallet_address) {
     keyboard.inline_keyboard.push([
       { 
         text: '🔍 Verifica PolygonScan', 
@@ -98,11 +284,9 @@ async function sendRequestNotification(request) {
   }
 
   try {
-    await bot.sendMessage(ADMIN_CHAT_ID, message, { 
-      reply_markup: keyboard
-    });
+    await bot.sendMessage(ADMIN_CHAT_ID, message, { reply_markup: keyboard });
   } catch (error) {
-    console.error('❌ Errore invio notifica Telegram:', error.message);
+    console.error('❌ Errore invio notifica:', error.message);
   }
 }
 
@@ -116,12 +300,12 @@ bot.on('callback_query', async (query) => {
   console.log(`🔘 Bottone premuto: ${action} per richiesta ${requestId}`);
 
   if (action === 'approve') {
-    const success = await approveRequest(requestId);
+    const success = await approveWithdrawal(requestId);
     
     if (success) {
-      await bot.answerCallbackQuery(query.id, { text: '✅ Richiesta approvata con successo!' });
+      await bot.answerCallbackQuery(query.id, { text: '✅ Prelievo approvato!' });
       await bot.editMessageText(
-        query.message.text + '\n\n✅ APPROVATO DA ADMIN', 
+        query.message.text + '\n\n✅ APPROVATO - Invia manualmente i token!', 
         {
           chat_id: ADMIN_CHAT_ID,
           message_id: query.message.message_id
@@ -135,9 +319,9 @@ bot.on('callback_query', async (query) => {
     const success = await rejectRequest(requestId);
     
     if (success) {
-      await bot.answerCallbackQuery(query.id, { text: '❌ Richiesta rifiutata!' });
+      await bot.answerCallbackQuery(query.id, { text: '❌ Prelievo rifiutato!' });
       await bot.editMessageText(
-        query.message.text + '\n\n❌ RIFIUTATO DA ADMIN', 
+        query.message.text + '\n\n❌ RIFIUTATO', 
         {
           chat_id: ADMIN_CHAT_ID,
           message_id: query.message.message_id
@@ -150,13 +334,13 @@ bot.on('callback_query', async (query) => {
 });
 
 // ============================================
-// APPROVA RICHIESTA (LOGICA COMPLETA)
+// APPROVA PRELIEVO (solo database, invio manuale)
 // ============================================
-async function approveRequest(requestId) {
+async function approveWithdrawal(requestId) {
   try {
-    console.log(`⏳ Approvazione richiesta ${requestId}...`);
+    console.log(`⏳ Approvazione prelievo ${requestId}...`);
 
-    // 1. Leggi dettagli richiesta
+    // Leggi richiesta
     const reqResponse = await axios.get(
       `${BASE44_API}/DepositRequest/${requestId}`,
       {
@@ -168,9 +352,8 @@ async function approveRequest(requestId) {
     );
 
     const request = reqResponse.data;
-    console.log(`📄 Richiesta trovata: ${request.user_email} - ${request.amount} $ROBOT`);
 
-    // 2. Leggi tutti i balance
+    // Leggi balance utente
     const balanceResponse = await axios.get(
       `${BASE44_API}/TokenBalance`,
       {
@@ -181,72 +364,29 @@ async function approveRequest(requestId) {
       }
     );
 
-    const allBalances = balanceResponse.data;
-    const userBalance = allBalances.find(b => b.user_email === request.user_email);
+    const balances = balanceResponse.data;
+    const userBalance = balances.find(b => b.user_email === request.user_email);
 
-    // 3. Aggiorna o crea balance
-    if (request.request_type === 'deposit') {
-      if (userBalance) {
-        // Aggiorna balance esistente
-        await axios.put(
-          `${BASE44_API}/TokenBalance/${userBalance.id}`,
-          {
-            balance: userBalance.balance + request.amount,
-            total_deposited: (userBalance.total_deposited || 0) + request.amount
-          },
-          {
-            headers: {
-              'api_key': BASE44_API_KEY,
-              'Content-Type': 'application/json'
-            }
-          }
-        );
-        console.log(`💰 Balance aggiornato: ${userBalance.balance} → ${userBalance.balance + request.amount}`);
-      } else {
-        // Crea nuovo balance (con bonus iniziale 1000)
-        await axios.post(
-          `${BASE44_API}/TokenBalance`,
-          {
-            user_email: request.user_email,
-            balance: 1000 + request.amount,
-            total_deposited: request.amount,
-            total_won: 0,
-            total_lost: 0,
-            total_bets: 0
-          },
-          {
-            headers: {
-              'api_key': BASE44_API_KEY,
-              'Content-Type': 'application/json'
-            }
-          }
-        );
-        console.log(`💰 Nuovo balance creato: ${1000 + request.amount} $ROBOT (1000 bonus + ${request.amount})`);
-      }
-    } else if (request.request_type === 'withdrawal') {
-      // Prelievo: sottrai dal balance
-      if (userBalance) {
-        const newBalance = Math.max(0, userBalance.balance - request.amount);
-        await axios.put(
-          `${BASE44_API}/TokenBalance/${userBalance.id}`,
-          {
-            balance: newBalance
-          },
-          {
-            headers: {
-              'api_key': BASE44_API_KEY,
-              'Content-Type': 'application/json'
-            }
-          }
-        );
-        console.log(`💸 Balance aggiornato (prelievo): ${userBalance.balance} → ${newBalance}`);
-      } else {
-        console.log('⚠️ Utente non ha balance, impossibile prelevare');
-        return false;
-      }
+    if (!userBalance || userBalance.balance < request.amount) {
+      console.log('⚠️ Balance insufficiente');
+      return false;
     }
 
-    // 4. Aggiorna status richiesta ad "approved"
+    // Sottrai dal balance
+    await axios.put(
+      `${BASE44_API}/TokenBalance/${userBalance.id}`,
+      {
+        balance: userBalance.balance - request.amount
+      },
+      {
+        headers: {
+          'api_key': BASE44_API_KEY,
+          'Content-Type': 'application/json'
+        }
+      }
+    );
+
+    // Aggiorna richiesta
     await axios.put(
       `${BASE44_API}/DepositRequest/${requestId}`,
       {
@@ -260,26 +400,11 @@ async function approveRequest(requestId) {
       }
     );
 
-    console.log(`✅ Richiesta ${requestId} approvata con successo!`);
-    
-    // 5. Invia messaggio di conferma all'utente (opzionale)
-    try {
-      await bot.sendMessage(
-        ADMIN_CHAT_ID, 
-        `✅ Deposito approvato!\n\n👤 ${request.user_email}\n💰 ${request.amount} $ROBOT accreditati`
-      );
-    } catch (e) {
-      console.log('Info aggiuntiva non inviata');
-    }
-
+    console.log(`✅ Prelievo ${requestId} approvato - Invia ${request.amount} $ROBOT a ${request.wallet_address}`);
     return true;
 
   } catch (error) {
-    console.error(`❌ Errore approvazione richiesta ${requestId}:`, error.message);
-    if (error.response) {
-      console.error('Response status:', error.response.status);
-      console.error('Response data:', JSON.stringify(error.response.data, null, 2));
-    }
+    console.error('❌ Errore approvazione prelievo:', error.message);
     return false;
   }
 }
@@ -289,8 +414,6 @@ async function approveRequest(requestId) {
 // ============================================
 async function rejectRequest(requestId) {
   try {
-    console.log(`⏳ Rifiuto richiesta ${requestId}...`);
-
     await axios.put(
       `${BASE44_API}/DepositRequest/${requestId}`,
       {
@@ -308,103 +431,91 @@ async function rejectRequest(requestId) {
     return true;
 
   } catch (error) {
-    console.error(`❌ Errore rifiuto richiesta ${requestId}:`, error.message);
-    if (error.response) {
-      console.error('Response status:', error.response.status);
-      console.error('Response data:', error.response.data);
-    }
+    console.error('❌ Errore rifiuto:', error.message);
     return false;
   }
 }
 
 // ============================================
-// COMANDO /status
+// UTILITY: Link PolygonScan
+// ============================================
+function getPolygonScanTxLink(txHash) {
+  return `https://polygonscan.com/tx/${txHash}`;
+}
+
+// ============================================
+// COMANDI TELEGRAM
 // ============================================
 bot.onText(/\/status/, async (msg) => {
   const chatId = msg.chat.id;
   
-  if (chatId.toString() !== ADMIN_CHAT_ID) {
-    await bot.sendMessage(chatId, '⛔ Non autorizzato!');
-    return;
-  }
+  if (chatId.toString() !== ADMIN_CHAT_ID) return;
 
   const statusMessage = `
 📊 STATUS BOT FUTURO UMANOIDE
 
 ✅ Bot attivo e in ascolto
-⏰ Check database ogni 30 secondi
-📋 Richieste monitorate: ${notifiedRequests.size}
-🤖 Telegram Chat ID: ${ADMIN_CHAT_ID}
-🔗 App ID: ${BASE44_APP_ID}
+⏰ Check vault ogni 30 secondi
+🏦 Vault: ${VAULT_ADDRESS}
+📋 TX processate: ${processedTransactions.size}
 
-Comandi disponibili:
-/status - Mostra questo messaggio
-/clear - Cancella cache notifiche
-/test - Invia notifica di test
+Comandi:
+/status - Questo messaggio
+/vault - Info vault
+/clear - Cancella cache TX
   `;
 
   await bot.sendMessage(chatId, statusMessage);
 });
 
-// ============================================
-// COMANDO /clear (pulisce cache)
-// ============================================
+bot.onText(/\/vault/, async (msg) => {
+  const chatId = msg.chat.id;
+  
+  if (chatId.toString() !== ADMIN_CHAT_ID) return;
+
+  await bot.sendMessage(chatId,
+    `🏦 INFO VAULT\n\n` +
+    `📍 Address:\n\`${VAULT_ADDRESS}\`\n\n` +
+    `🔗 PolygonScan:\nhttps://polygonscan.com/address/${VAULT_ADDRESS}`,
+    { parse_mode: 'Markdown' }
+  );
+});
+
 bot.onText(/\/clear/, async (msg) => {
   const chatId = msg.chat.id;
   
   if (chatId.toString() !== ADMIN_CHAT_ID) return;
 
-  const count = notifiedRequests.size;
-  notifiedRequests.clear();
-  await bot.sendMessage(chatId, `🗑️ Cache cancellata! (${count} notifiche rimosse)`);
-});
-
-// ============================================
-// COMANDO /test (test notifica)
-// ============================================
-bot.onText(/\/test/, async (msg) => {
-  const chatId = msg.chat.id;
-  
-  if (chatId.toString() !== ADMIN_CHAT_ID) return;
-
-  const testMessage = `
-🧪 TEST NOTIFICA
-
-Questo è un messaggio di test per verificare
-che il bot funzioni correttamente.
-
-✅ Se vedi questo messaggio, il bot è attivo!
-  `;
-
-  await bot.sendMessage(chatId, testMessage);
+  const count = processedTransactions.size;
+  processedTransactions.clear();
+  await bot.sendMessage(chatId, `🗑️ Cache cancellata! (${count} TX rimosse)`);
 });
 
 // ============================================
 // AVVIO BOT E SERVER
 // ============================================
+console.log('🚀 Avvio bot...');
+
+// Controlli periodici
+setInterval(checkVaultDeposits, CHECK_INTERVAL); // Depositi automatici
+setInterval(checkPendingRequests, CHECK_INTERVAL); // Prelievi manuali
 
 // Prima esecuzione immediata
-console.log('🚀 Avvio iniziale...');
+checkVaultDeposits();
 checkPendingRequests();
 
-// Poi ogni 30 secondi
-setInterval(checkPendingRequests, CHECK_INTERVAL);
-
-// Endpoint HTTP per health check
 app.get('/', (req, res) => {
-  res.send('🤖 Bot Futuro Umanoide attivo!');
+  res.send('🤖 Bot Futuro Umanoide + Vault System attivo!');
 });
 
 app.get('/health', (req, res) => {
   res.json({
     status: 'ok',
-    bot: 'active',
-    notifications: notifiedRequests.size,
-    app_id: BASE44_APP_ID
+    vault: VAULT_ADDRESS,
+    processed_tx: processedTransactions.size
   });
 });
 
-// Avvia server HTTP
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log('');
@@ -412,37 +523,19 @@ app.listen(PORT, () => {
   console.log('🤖 BOT FUTURO UMANOIDE ATTIVO!');
   console.log('🚀 ================================');
   console.log(`📡 Server HTTP su porta ${PORT}`);
-  console.log(`⏰ Monitoring ogni ${CHECK_INTERVAL/1000} secondi`);
-  console.log(`📱 Admin Telegram ID: ${ADMIN_CHAT_ID}`);
-  console.log(`🔗 App Base44 ID: ${BASE44_APP_ID}`);
+  console.log(`🏦 Vault: ${VAULT_ADDRESS}`);
+  console.log(`⏰ Monitoring ogni ${CHECK_INTERVAL/1000}s`);
   console.log('');
   
-  // Invia messaggio di avvio
-  bot.sendMessage(
-    ADMIN_CHAT_ID, 
-    '🤖 *Bot Futuro Umanoide avviato con successo!*\n\nUsa /status per info.\nUsa /test per verificare funzionamento.',
+  bot.sendMessage(ADMIN_CHAT_ID, 
+    '🤖 *Bot + Vault System avviato!*\n\n' +
+    '✅ Depositi automatici attivi\n' +
+    '✅ Prelievi notificati\n\n' +
+    'Usa /vault per info vault',
     { parse_mode: 'Markdown' }
-  ).catch(err => console.error('Errore invio messaggio avvio:', err.message));
+  ).catch(err => console.log('Avvia conversazione con bot prima'));
 });
 
-// Gestione errori bot
 bot.on('polling_error', (error) => {
-  console.error('❌ Polling error:', error.code, error.message);
-});
-
-bot.on('error', (error) => {
-  console.error('❌ Bot error:', error.message);
-});
-
-// Gestione chiusura pulita
-process.on('SIGINT', () => {
-  console.log('\n👋 Chiusura bot...');
-  bot.stopPolling();
-  process.exit(0);
-});
-
-process.on('SIGTERM', () => {
-  console.log('\n👋 Chiusura bot...');
-  bot.stopPolling();
-  process.exit(0);
+  console.error('❌ Polling error:', error.code);
 });
