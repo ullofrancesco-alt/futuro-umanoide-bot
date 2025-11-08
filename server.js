@@ -9,14 +9,12 @@ const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN || '8239600520:AAHMVAEsUu3Hdd4
 const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID || '585681146';
 
 // Base44 API
-const BASE44_API = process.env.BASE44_API || 'https://app.base44.com/api/apps/690e1a0262a871b277571301/entities';
-const BASE44_API_KEY = process.env.BASE44_API_KEY || '601a9651d7f9433d92341d73eb30398b';
-const BASE44_APP_ID = process.env.BASE44_APP_ID || '690e1a0262a871b277571301';
+const BASE44_API = 'https://app.base44.com/api/apps/690e1a0262a871b277571301/entities';
+const BASE44_API_KEY = '601a9651d7f9433d92341d73eb30398b';
 
-// Vault & PolygonScan
-const VAULT_ADDRESS = process.env.VAULT_ADDRESS || '0x78cFdE6e71Cf5cED4afFce5578D2223b51907a49';
+// Vault Configuration
+const VAULT_ADDRESS = '0x78cFdE6e71Cf5cED4afFce5578D2223b51907a49';
 const ROBOT_TOKEN_ADDRESS = '0xb0d2A7b1F1EC7D39409E1D671473020d20547B55';
-const POLYGONSCAN_API_KEY = process.env.POLYGONSCAN_API_KEY || 'YourPolygonScanAPIKey'; // Get free at polygonscan.com
 
 const CHECK_INTERVAL = 30000; // 30 secondi
 
@@ -25,16 +23,20 @@ const CHECK_INTERVAL = 30000; // 30 secondi
 // ============================================
 const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
 const app = express();
-const processedTransactions = new Set(); // Cache transazioni già processate
+const processedTransactions = new Set();
+let lastCheckedBlock = 0;
+
+console.log('🤖 Initializing bot...');
+console.log('🏦 Vault Address:', VAULT_ADDRESS);
 
 // ============================================
 // FUNZIONE: Monitora Depositi al Vault
 // ============================================
 async function checkVaultDeposits() {
   try {
-    console.log('🔍 Controllo depositi al vault...');
+    console.log('🔍 Checking vault deposits...');
     
-    // Leggi transazioni token in arrivo al vault
+    // Chiama PolygonScan API SENZA API KEY (5 calls/sec free!)
     const response = await axios.get('https://api.polygonscan.com/api', {
       params: {
         module: 'account',
@@ -42,60 +44,89 @@ async function checkVaultDeposits() {
         contractaddress: ROBOT_TOKEN_ADDRESS,
         address: VAULT_ADDRESS,
         page: 1,
-        offset: 100,
+        offset: 50,
         sort: 'desc',
-        apikey: POLYGONSCAN_API_KEY
-      }
+        startblock: lastCheckedBlock > 0 ? lastCheckedBlock : 0
+      },
+      timeout: 10000
     });
 
     if (response.data.status !== '1') {
-      console.log('⚠️ Errore PolygonScan API:', response.data.message);
+      if (response.data.message === 'No transactions found') {
+        console.log('📭 No new transactions');
+        return;
+      }
+      console.log('⚠️ PolygonScan API response:', response.data.message);
       return;
     }
 
     const transactions = response.data.result;
+    
+    if (!transactions || transactions.length === 0) {
+      console.log('📭 No transactions found');
+      return;
+    }
 
-    // Filtra transazioni recenti (ultima ora) e in arrivo al vault
-    const recentTxs = transactions.filter(tx => {
-      const txTime = parseInt(tx.timeStamp);
-      const oneHourAgo = Date.now() / 1000 - 3600;
-      return txTime > oneHourAgo && tx.to.toLowerCase() === VAULT_ADDRESS.toLowerCase();
-    });
-
-    console.log(`📊 Trovate ${recentTxs.length} transazioni recenti al vault`);
-
-    for (const tx of recentTxs) {
-      // Skip se già processata
-      if (processedTransactions.has(tx.hash)) continue;
-
-      const senderAddress = tx.from;
-      const amount = parseInt(tx.value) / 1e18; // Converti da wei
-      const txHash = tx.hash;
-
-      console.log(`💰 Nuova transazione: ${senderAddress} → ${amount} $ROBOT`);
-
-      // Cerca se esiste un utente con questo wallet nel database
-      const userEmail = await findUserByWallet(senderAddress);
-
-      if (userEmail) {
-        // Utente registrato - accredita automaticamente
-        await processAutoDeposit(userEmail, senderAddress, amount, txHash);
-        processedTransactions.add(txHash);
-      } else {
-        // Wallet sconosciuto - notifica admin
-        await bot.sendMessage(ADMIN_CHAT_ID,
-          `⚠️ DEPOSITO DA WALLET SCONOSCIUTO\n\n` +
-          `💰 Importo: ${amount} $ROBOT\n` +
-          `📍 From: ${senderAddress}\n` +
-          `🔗 ${getPolygonScanTxLink(txHash)}\n\n` +
-          `❓ Wallet non associato a nessun utente registrato`
-        );
-        processedTransactions.add(txHash);
+    // Aggiorna ultimo blocco controllato
+    if (transactions.length > 0) {
+      const latestBlock = Math.max(...transactions.map(tx => parseInt(tx.blockNumber)));
+      if (latestBlock > lastCheckedBlock) {
+        lastCheckedBlock = latestBlock;
       }
     }
 
+    // Filtra solo transazioni IN ARRIVO al vault (to = vault address)
+    const incomingTxs = transactions.filter(tx => 
+      tx.to.toLowerCase() === VAULT_ADDRESS.toLowerCase() &&
+      !processedTransactions.has(tx.hash)
+    );
+
+    if (incomingTxs.length === 0) {
+      console.log('📭 No new incoming transactions');
+      return;
+    }
+
+    console.log(`💰 Found ${incomingTxs.length} new incoming transactions`);
+
+    for (const tx of incomingTxs) {
+      const senderAddress = tx.from;
+      const amount = parseFloat(tx.value) / 1e18; // Converti da wei
+      const txHash = tx.hash;
+      const blockNumber = tx.blockNumber;
+
+      console.log(`\n💵 New deposit:`);
+      console.log(`   From: ${senderAddress}`);
+      console.log(`   Amount: ${amount} $ROBOT`);
+      console.log(`   TX: ${txHash.slice(0, 10)}...`);
+
+      // Cerca utente con questo wallet
+      const userEmail = await findUserByWallet(senderAddress);
+
+      if (userEmail) {
+        console.log(`   ✅ User found: ${userEmail}`);
+        await processAutoDeposit(userEmail, senderAddress, amount, txHash);
+      } else {
+        console.log(`   ⚠️ Unknown wallet - notifying admin`);
+        await bot.sendMessage(ADMIN_CHAT_ID,
+          `⚠️ *DEPOSITO DA WALLET SCONOSCIUTO*\n\n` +
+          `💰 Importo: ${amount} $ROBOT\n` +
+          `📍 From: \`${senderAddress}\`\n` +
+          `📦 Block: ${blockNumber}\n` +
+          `🔗 [Verifica TX](https://polygonscan.com/tx/${txHash})\n\n` +
+          `❓ Wallet non associato a nessun utente`,
+          { parse_mode: 'Markdown', disable_web_page_preview: true }
+        );
+      }
+
+      processedTransactions.add(txHash);
+    }
+
   } catch (error) {
-    console.error('❌ Errore controllo vault:', error.message);
+    if (error.code === 'ECONNABORTED') {
+      console.error('⏱️ Timeout checking vault - will retry');
+    } else {
+      console.error('❌ Error checking vault:', error.message);
+    }
   }
 }
 
@@ -104,15 +135,17 @@ async function checkVaultDeposits() {
 // ============================================
 async function findUserByWallet(walletAddress) {
   try {
-    // Cerca nelle richieste deposito per associare wallet → email
     const response = await axios.get(`${BASE44_API}/DepositRequest`, {
       headers: {
         'api_key': BASE44_API_KEY,
         'Content-Type': 'application/json'
-      }
+      },
+      timeout: 5000
     });
 
     const requests = response.data;
+    
+    // Cerca nelle richieste precedenti
     const matchingRequest = requests.find(r => 
       r.wallet_address && 
       r.wallet_address.toLowerCase() === walletAddress.toLowerCase()
@@ -121,7 +154,7 @@ async function findUserByWallet(walletAddress) {
     return matchingRequest ? matchingRequest.user_email : null;
 
   } catch (error) {
-    console.error('Errore ricerca utente:', error.message);
+    console.error('Error finding user:', error.message);
     return null;
   }
 }
@@ -131,14 +164,15 @@ async function findUserByWallet(walletAddress) {
 // ============================================
 async function processAutoDeposit(userEmail, walletAddress, amount, txHash) {
   try {
-    console.log(`✅ Auto-deposito per ${userEmail}: ${amount} $ROBOT`);
+    console.log(`   🔄 Processing auto-deposit for ${userEmail}`);
 
     // 1. Leggi balance utente
     const balanceResponse = await axios.get(`${BASE44_API}/TokenBalance`, {
       headers: {
         'api_key': BASE44_API_KEY,
         'Content-Type': 'application/json'
-      }
+      },
+      timeout: 5000
     });
 
     const balances = balanceResponse.data;
@@ -156,16 +190,17 @@ async function processAutoDeposit(userEmail, walletAddress, amount, txHash) {
           headers: {
             'api_key': BASE44_API_KEY,
             'Content-Type': 'application/json'
-          }
+          },
+          timeout: 5000
         }
       );
-      console.log(`💰 Balance aggiornato: ${userBalance.balance} → ${userBalance.balance + amount}`);
+      console.log(`   💰 Balance updated: ${userBalance.balance} → ${userBalance.balance + amount}`);
     } else {
       await axios.post(
         `${BASE44_API}/TokenBalance`,
         {
           user_email: userEmail,
-          balance: 1000 + amount, // Bonus iniziale + deposito
+          balance: 1000 + amount,
           total_deposited: amount,
           total_won: 0,
           total_lost: 0,
@@ -175,13 +210,14 @@ async function processAutoDeposit(userEmail, walletAddress, amount, txHash) {
           headers: {
             'api_key': BASE44_API_KEY,
             'Content-Type': 'application/json'
-          }
+          },
+          timeout: 5000
         }
       );
-      console.log(`💰 Nuovo balance creato: ${1000 + amount} $ROBOT`);
+      console.log(`   💰 New balance created: ${1000 + amount} $ROBOT`);
     }
 
-    // 3. Crea record deposito approvato
+    // 3. Crea record deposito
     await axios.post(
       `${BASE44_API}/DepositRequest`,
       {
@@ -190,63 +226,80 @@ async function processAutoDeposit(userEmail, walletAddress, amount, txHash) {
         amount: amount,
         status: 'approved',
         request_type: 'deposit',
-        admin_notes: `Auto-approvato - TX: ${txHash}`
+        admin_notes: `Auto-approved - TX: ${txHash}`
       },
       {
         headers: {
           'api_key': BASE44_API_KEY,
           'Content-Type': 'application/json'
-        }
+        },
+        timeout: 5000
       }
     );
 
-    // 4. Notifica admin su Telegram
+    // 4. Notifica admin
     await bot.sendMessage(ADMIN_CHAT_ID,
-      `✅ DEPOSITO AUTO-APPROVATO\n\n` +
+      `✅ *DEPOSITO AUTO-APPROVATO*\n\n` +
       `👤 Utente: ${userEmail}\n` +
       `💰 Importo: ${amount} $ROBOT\n` +
-      `📍 Wallet: ${walletAddress}\n` +
-      `🔗 TX: ${getPolygonScanTxLink(txHash)}\n\n` +
-      `✨ Saldo aggiornato automaticamente!`
+      `📍 Wallet: \`${walletAddress}\`\n` +
+      `🔗 [Verifica TX](https://polygonscan.com/tx/${txHash})\n\n` +
+      `✨ Saldo aggiornato automaticamente!`,
+      { parse_mode: 'Markdown', disable_web_page_preview: true }
     );
 
+    console.log(`   ✅ Auto-deposit completed!`);
     return true;
 
   } catch (error) {
-    console.error('❌ Errore auto-deposito:', error.message);
+    console.error('   ❌ Error processing auto-deposit:', error.message);
+    
+    // Notifica admin dell'errore
+    await bot.sendMessage(ADMIN_CHAT_ID,
+      `❌ *ERRORE AUTO-DEPOSITO*\n\n` +
+      `User: ${userEmail}\n` +
+      `Amount: ${amount} $ROBOT\n` +
+      `Error: ${error.message}\n\n` +
+      `⚠️ Approva manualmente dal dashboard!`
+    ).catch(e => console.error('Failed to send error notification'));
+    
     return false;
   }
 }
 
 // ============================================
-// FUNZIONE: Controlla Richieste Prelievo Pending
+// FUNZIONE: Check Prelievi Pending
 // ============================================
-async function checkPendingRequests() {
+async function checkPendingWithdrawals() {
   try {
-    console.log('🔍 Controllo richieste prelievo pending...');
+    console.log('🔍 Checking pending withdrawals...');
     
     const response = await axios.get(`${BASE44_API}/DepositRequest`, {
       headers: {
         'api_key': BASE44_API_KEY,
         'Content-Type': 'application/json'
-      }
+      },
+      timeout: 5000
     });
 
-    const allRequests = response.data;
-    const pendingWithdrawals = allRequests.filter(r => 
-      r.status === 'pending' && r.request_type === 'withdrawal'
+    const requests = response.data;
+    const pendingWithdrawals = requests.filter(r => 
+      r.status === 'pending' && 
+      r.request_type === 'withdrawal' &&
+      !processedTransactions.has(`withdrawal_${r.id}`)
     );
 
     if (pendingWithdrawals.length > 0) {
-      console.log(`📋 Trovate ${pendingWithdrawals.length} richieste prelievo pending`);
+      console.log(`📋 Found ${pendingWithdrawals.length} pending withdrawals`);
       
       for (const req of pendingWithdrawals) {
         await sendWithdrawalNotification(req);
+        processedTransactions.add(`withdrawal_${req.id}`);
       }
     }
 
   } catch (error) {
-    console.error('❌ Errore controllo prelievi:', error.message);
+    console.error('❌ Error checking withdrawals:', error.message);
   }
 }
 
@@ -254,16 +307,13 @@ async function checkPendingRequests() {
 // INVIA NOTIFICA PRELIEVO
 // ============================================
 async function sendWithdrawalNotification(request) {
-  const message = `
-🔔 RICHIESTA PRELIEVO ⬆️
-
-👤 Utente: ${request.user_email}
-💰 Importo: ${request.amount} $ROBOT
-📍 Wallet: ${request.wallet_address || 'N/A'}
-🆔 ID: ${request.id}
-
-⏰ Data: ${new Date(request.created_date).toLocaleString('it-IT')}
-  `;
+  const message = 
+    `🔔 *RICHIESTA PRELIEVO* ⬆️\n\n` +
+    `👤 Utente: ${request.user_email}\n` +
+    `💰 Importo: ${request.amount} $ROBOT\n` +
+    `📍 Wallet: \`${request.wallet_address || 'N/A'}\`\n` +
+    `🆔 ID: ${request.id}\n\n` +
+    `⏰ ${new Date(request.created_date).toLocaleString('it-IT')}`;
 
   const keyboard = {
     inline_keyboard: [
@@ -277,27 +327,30 @@ async function sendWithdrawalNotification(request) {
   if (request.wallet_address) {
     keyboard.inline_keyboard.push([
       { 
-        text: '🔍 Verifica PolygonScan', 
+        text: '🔍 Verifica Wallet', 
         url: `https://polygonscan.com/address/${request.wallet_address}` 
       }
     ]);
   }
 
   try {
-    await bot.sendMessage(ADMIN_CHAT_ID, message, { reply_markup: keyboard });
+    await bot.sendMessage(ADMIN_CHAT_ID, message, { 
+      reply_markup: keyboard,
+      parse_mode: 'Markdown'
+    });
   } catch (error) {
-    console.error('❌ Errore invio notifica:', error.message);
+    console.error('❌ Error sending notification:', error.message);
   }
 }
 
 // ============================================
-// GESTIONE CLICK SUI BOTTONI
+// GESTIONE CALLBACK BOTTONI
 // ============================================
 bot.on('callback_query', async (query) => {
   const data = query.data;
   const [action, requestId] = data.split('_');
 
-  console.log(`🔘 Bottone premuto: ${action} per richiesta ${requestId}`);
+  console.log(`🔘 Button clicked: ${action} for request ${requestId}`);
 
   if (action === 'approve') {
     const success = await approveWithdrawal(requestId);
@@ -305,14 +358,15 @@ bot.on('callback_query', async (query) => {
     if (success) {
       await bot.answerCallbackQuery(query.id, { text: '✅ Prelievo approvato!' });
       await bot.editMessageText(
-        query.message.text + '\n\n✅ APPROVATO - Invia manualmente i token!', 
+        query.message.text + '\n\n✅ *APPROVATO* - Invia manualmente i token dal vault!', 
         {
           chat_id: ADMIN_CHAT_ID,
-          message_id: query.message.message_id
+          message_id: query.message.message_id,
+          parse_mode: 'Markdown'
         }
       );
     } else {
-      await bot.answerCallbackQuery(query.id, { text: '❌ Errore durante approvazione!' });
+      await bot.answerCallbackQuery(query.id, { text: '❌ Errore approvazione!' });
     }
     
   } else if (action === 'reject') {
@@ -321,46 +375,47 @@ bot.on('callback_query', async (query) => {
     if (success) {
       await bot.answerCallbackQuery(query.id, { text: '❌ Prelievo rifiutato!' });
       await bot.editMessageText(
-        query.message.text + '\n\n❌ RIFIUTATO', 
+        query.message.text + '\n\n❌ *RIFIUTATO*', 
         {
           chat_id: ADMIN_CHAT_ID,
-          message_id: query.message.message_id
+          message_id: query.message.message_id,
+          parse_mode: 'Markdown'
         }
       );
     } else {
-      await bot.answerCallbackQuery(query.id, { text: '❌ Errore durante rifiuto!' });
+      await bot.answerCallbackQuery(query.id, { text: '❌ Errore rifiuto!' });
     }
   }
 });
 
 // ============================================
-// APPROVA PRELIEVO (solo database, invio manuale)
+// APPROVA PRELIEVO
 // ============================================
 async function approveWithdrawal(requestId) {
   try {
-    console.log(`⏳ Approvazione prelievo ${requestId}...`);
+    console.log(`⏳ Approving withdrawal ${requestId}...`);
 
-    // Leggi richiesta
     const reqResponse = await axios.get(
       `${BASE44_API}/DepositRequest/${requestId}`,
       {
         headers: {
           'api_key': BASE44_API_KEY,
           'Content-Type': 'application/json'
-        }
+        },
+        timeout: 5000
       }
     );
 
     const request = reqResponse.data;
 
-    // Leggi balance utente
     const balanceResponse = await axios.get(
       `${BASE44_API}/TokenBalance`,
       {
         headers: {
           'api_key': BASE44_API_KEY,
           'Content-Type': 'application/json'
-        }
+        },
+        timeout: 5000
       }
     );
 
@@ -368,11 +423,16 @@ async function approveWithdrawal(requestId) {
     const userBalance = balances.find(b => b.user_email === request.user_email);
 
     if (!userBalance || userBalance.balance < request.amount) {
-      console.log('⚠️ Balance insufficiente');
+      console.log('⚠️ Insufficient balance');
+      await bot.sendMessage(ADMIN_CHAT_ID, 
+        `⚠️ Balance insufficiente per ${request.user_email}!\n` +
+        `Richiesto: ${request.amount}\n` +
+        `Disponibile: ${userBalance?.balance || 0}`
+      );
       return false;
     }
 
-    // Sottrai dal balance
+    // Sottrai balance
     await axios.put(
       `${BASE44_API}/TokenBalance/${userBalance.id}`,
       {
@@ -382,11 +442,12 @@ async function approveWithdrawal(requestId) {
         headers: {
           'api_key': BASE44_API_KEY,
           'Content-Type': 'application/json'
-        }
+        },
+        timeout: 5000
       }
     );
 
-    // Aggiorna richiesta
+    // Approva richiesta
     await axios.put(
       `${BASE44_API}/DepositRequest/${requestId}`,
       {
@@ -396,15 +457,25 @@ async function approveWithdrawal(requestId) {
         headers: {
           'api_key': BASE44_API_KEY,
           'Content-Type': 'application/json'
-        }
+        },
+        timeout: 5000
       }
     );
 
-    console.log(`✅ Prelievo ${requestId} approvato - Invia ${request.amount} $ROBOT a ${request.wallet_address}`);
+    await bot.sendMessage(ADMIN_CHAT_ID,
+      `📤 *AZIONE RICHIESTA*\n\n` +
+      `Invia manualmente dal vault:\n` +
+      `💰 Amount: ${request.amount} $ROBOT\n` +
+      `📍 To: \`${request.wallet_address}\`\n\n` +
+      `✅ Balance già sottratto dal database`,
+      { parse_mode: 'Markdown' }
+    );
+
+    console.log(`✅ Withdrawal ${requestId} approved`);
     return true;
 
   } catch (error) {
-    console.error('❌ Errore approvazione prelievo:', error.message);
+    console.error('❌ Error approving withdrawal:', error.message);
     return false;
   }
 }
@@ -423,49 +494,52 @@ async function rejectRequest(requestId) {
         headers: {
           'api_key': BASE44_API_KEY,
           'Content-Type': 'application/json'
-        }
+        },
+        timeout: 5000
       }
     );
 
-    console.log(`❌ Richiesta ${requestId} rifiutata!`);
+    console.log(`❌ Request ${requestId} rejected`);
     return true;
 
   } catch (error) {
-    console.error('❌ Errore rifiuto:', error.message);
+    console.error('❌ Error rejecting:', error.message);
     return false;
   }
 }
 
 // ============================================
-// UTILITY: Link PolygonScan
-// ============================================
-function getPolygonScanTxLink(txHash) {
-  return `https://polygonscan.com/tx/${txHash}`;
-}
-
-// ============================================
 // COMANDI TELEGRAM
 // ============================================
+bot.onText(/\/start/, async (msg) => {
+  const chatId = msg.chat.id;
+  
+  await bot.sendMessage(chatId,
+    `🤖 *Bot Futuro Umanoide + Vault System*\n\n` +
+    `✅ Bot attivo e operativo\n` +
+    `🏦 Vault: \`${VAULT_ADDRESS}\`\n\n` +
+    `Comandi disponibili:\n` +
+    `/status - Info bot\n` +
+    `/vault - Info vault\n` +
+    `/stats - Statistiche`,
+    { parse_mode: 'Markdown' }
+  );
+});
+
 bot.onText(/\/status/, async (msg) => {
   const chatId = msg.chat.id;
   
   if (chatId.toString() !== ADMIN_CHAT_ID) return;
 
-  const statusMessage = `
-📊 STATUS BOT FUTURO UMANOIDE
+  const statusMessage = 
+    `📊 *STATUS BOT*\n\n` +
+    `✅ Bot attivo\n` +
+    `⏰ Check ogni 30s\n` +
+    `🏦 Vault: \`${VAULT_ADDRESS}\`\n` +
+    `📋 TX cache: ${processedTransactions.size}\n` +
+    `📦 Last block: ${lastCheckedBlock}`;
 
-✅ Bot attivo e in ascolto
-⏰ Check vault ogni 30 secondi
-🏦 Vault: ${VAULT_ADDRESS}
-📋 TX processate: ${processedTransactions.size}
-
-Comandi:
-/status - Questo messaggio
-/vault - Info vault
-/clear - Cancella cache TX
-  `;
-
-  await bot.sendMessage(chatId, statusMessage);
+  await bot.sendMessage(chatId, statusMessage, { parse_mode: 'Markdown' });
 });
 
 bot.onText(/\/vault/, async (msg) => {
@@ -474,10 +548,11 @@ bot.onText(/\/vault/, async (msg) => {
   if (chatId.toString() !== ADMIN_CHAT_ID) return;
 
   await bot.sendMessage(chatId,
-    `🏦 INFO VAULT\n\n` +
+    `🏦 *INFO VAULT*\n\n` +
     `📍 Address:\n\`${VAULT_ADDRESS}\`\n\n` +
-    `🔗 PolygonScan:\nhttps://polygonscan.com/address/${VAULT_ADDRESS}`,
-    { parse_mode: 'Markdown' }
+    `🪙 Token: $ROBOT\n` +
+    `🔗 [Verifica PolygonScan](https://polygonscan.com/address/${VAULT_ADDRESS})`,
+    { parse_mode: 'Markdown', disable_web_page_preview: true }
   );
 });
 
@@ -488,54 +563,68 @@ bot.onText(/\/clear/, async (msg) => {
 
   const count = processedTransactions.size;
   processedTransactions.clear();
-  await bot.sendMessage(chatId, `🗑️ Cache cancellata! (${count} TX rimosse)`);
+  await bot.sendMessage(chatId, `🗑️ Cache cleared! (${count} TX removed)`);
 });
 
 // ============================================
-// AVVIO BOT E SERVER
+// HEALTH CHECK ENDPOINT
 // ============================================
-console.log('🚀 Avvio bot...');
-
-// Controlli periodici
-setInterval(checkVaultDeposits, CHECK_INTERVAL); // Depositi automatici
-setInterval(checkPendingRequests, CHECK_INTERVAL); // Prelievi manuali
-
-// Prima esecuzione immediata
-checkVaultDeposits();
-checkPendingRequests();
-
 app.get('/', (req, res) => {
-  res.send('🤖 Bot Futuro Umanoide + Vault System attivo!');
+  res.send('🤖 Bot Futuro Umanoide + Vault System - Active!');
 });
 
 app.get('/health', (req, res) => {
   res.json({
     status: 'ok',
     vault: VAULT_ADDRESS,
-    processed_tx: processedTransactions.size
+    processed_tx: processedTransactions.size,
+    last_block: lastCheckedBlock,
+    uptime: process.uptime()
   });
 });
 
+// ============================================
+// AVVIO
+// ============================================
 const PORT = process.env.PORT || 3000;
+
 app.listen(PORT, () => {
   console.log('');
   console.log('🚀 ================================');
-  console.log('🤖 BOT FUTURO UMANOIDE ATTIVO!');
+  console.log('🤖 BOT ACTIVE!');
   console.log('🚀 ================================');
-  console.log(`📡 Server HTTP su porta ${PORT}`);
+  console.log(`📡 HTTP Server: ${PORT}`);
   console.log(`🏦 Vault: ${VAULT_ADDRESS}`);
-  console.log(`⏰ Monitoring ogni ${CHECK_INTERVAL/1000}s`);
+  console.log(`⏰ Check interval: ${CHECK_INTERVAL/1000}s`);
+  console.log(`📊 API: No key needed (free tier)`);
   console.log('');
   
+  // Start monitoring
+  setInterval(checkVaultDeposits, CHECK_INTERVAL);
+  setInterval(checkPendingWithdrawals, CHECK_INTERVAL);
+  
+  // Initial check
+  setTimeout(() => {
+    checkVaultDeposits();
+    checkPendingWithdrawals();
+  }, 5000);
+  
   bot.sendMessage(ADMIN_CHAT_ID, 
-    '🤖 *Bot + Vault System avviato!*\n\n' +
+    '🤖 *Bot + Vault System Avviato!*\n\n' +
     '✅ Depositi automatici attivi\n' +
-    '✅ Prelievi notificati\n\n' +
-    'Usa /vault per info vault',
+    '✅ Prelievi notificati\n' +
+    '✅ Nessuna API key richiesta\n\n' +
+    'Usa /vault per info',
     { parse_mode: 'Markdown' }
-  ).catch(err => console.log('Avvia conversazione con bot prima'));
+  ).catch(err => console.log('⚠️ Start conversation with bot first'));
 });
 
 bot.on('polling_error', (error) => {
   console.error('❌ Polling error:', error.code);
+});
+
+process.on('SIGTERM', () => {
+  console.log('👋 Shutting down gracefully...');
+  bot.stopPolling();
+  process.exit(0);
 });
