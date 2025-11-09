@@ -1,8 +1,7 @@
-
 {
-  "name": "futuro-umanoide-telegram-bot",
-  "version": "1.0.0",
-  "description": "Bot Telegram per notifiche depositi/prelievi Futuro Umanoide",
+  "name": "futuro-umanoide-backend",
+  "version": "2.0.0",
+  "description": "Backend completo: Bot Telegram + Depositi Auto + Cron Betting + Withdrawals",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
@@ -11,7 +10,10 @@
   "dependencies": {
     "express": "^4.18.2",
     "node-telegram-bot-api": "^0.64.0",
-    "axios": "^1.6.2"
+    "axios": "^1.6.2",
+    "ethers": "^6.9.0",
+    "node-cron": "^3.0.3",
+    "dotenv": "^16.3.1"
   },
   "devDependencies": {
     "nodemon": "^3.0.2"
