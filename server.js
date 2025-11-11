@@ -736,11 +736,11 @@ app.listen(PORT, () => {
   console.log('🚀 Server started on port', PORT);
   console.log('✅ Bot initialized');
   
-  setInterval(checkVaultDeposits, CHECK_INTERVAL);
-  setInterval(checkPendingSwaps, CHECK_INTERVAL);
-  setInterval(checkPendingReverseSwaps, CHECK_INTERVAL);
-  setInterval(processReverseSwaps, 60000);
-  setInterval(performHealthCheck, 5 * 60 * 1000);
+setInterval(() => {
+  checkVaultDeposits();
+  checkPendingSwaps();
+  checkPendingReverseSwaps();
+}, 5 * 60000); // ogni 5 minuti invece di 1
   
   setTimeout(() => {
     checkVaultDeposits();
@@ -765,3 +765,4 @@ process.on('SIGTERM', () => {
   bot.stopPolling(); 
   process.exit(0); 
 });
+
