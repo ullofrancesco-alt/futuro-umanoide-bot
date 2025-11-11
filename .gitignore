@@ -1,4 +1,3 @@
- 3. .gitignore
 # Dependencies
 node_modules/
 package-lock.json
@@ -10,12 +9,13 @@ yarn.lock
 .env.production
 
 # Logs
+logs/
 *.log
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 
-# OS files
+# OS
 .DS_Store
 Thumbs.db
 
@@ -24,6 +24,9 @@ Thumbs.db
 .idea/
 *.swp
 *.swo
+*~
 
-# Railway
-.railway/
+# Temporary files
+tmp/
+temp/
+*.tmp
