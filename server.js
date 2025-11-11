@@ -22,7 +22,14 @@ const USDC_CONTRACT = '0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359';
 const POLYGON_RPC_URL = process.env.POLYGON_RPC_URL || 'https://polygon-rpc.com';
 const ADMIN_PRIVATE_KEY = process.env.ADMIN_PRIVATE_KEY;
 
+// 🆕 AUTO-APPROVAL LIMITS (modificabili!)
+const AUTO_APPROVE_MAX_DEPOSIT_USDC = parseFloat(process.env.AUTO_APPROVE_MAX_DEPOSIT_USDC || '100');
+const AUTO_APPROVE_MAX_WITHDRAW_BOT = parseFloat(process.env.AUTO_APPROVE_MAX_WITHDRAW_BOT || '1000');
+const AUTO_APPROVE_ENABLED = process.env.AUTO_APPROVE_ENABLED !== 'false';
+
 const CHECK_INTERVAL = 30000;
+const RETRY_ATTEMPTS = 3;
+const RETRY_DELAY = 5000;
 
 // ============================================
 // INIZIALIZZAZIONE
@@ -31,21 +38,58 @@ const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
 const app = express();
 const processedTransactions = new Set();
 let lastCheckedBlock = 0;
+let lastHealthCheck = Date.now();
+let errorCount = 0;
+let successCount = 0;
 
-console.log('🤖 Initializing Futuro Umanoide Backend v2.2...');
-console.log('🏦 Vault Address:', VAULT_ADDRESS);
-console.log('💰 USDC Contract:', USDC_CONTRACT);
+console.log('🤖 Initializing Futuro Umanoide Backend v3.0...');
+console.log('🏦 Vault:', VAULT_ADDRESS);
+console.log('💰 USDC:', USDC_CONTRACT);
+console.log('🤖 Auto-Approve:', AUTO_APPROVE_ENABLED ? '✅ ENABLED' : '❌ DISABLED');
+console.log('💵 Max Auto Deposit:', AUTO_APPROVE_MAX_DEPOSIT_USDC, 'USDC');
+console.log('💸 Max Auto Withdraw:', AUTO_APPROVE_MAX_WITHDRAW_BOT, '$BOT');
 
 // ============================================
-// MONITORA SWAP USDC → $BOT
+// HELPER: RETRY CON BACKOFF
+// ============================================
+async function retryWithBackoff(fn, fnName, maxAttempts = RETRY_ATTEMPTS) {
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      return await fn();
+    } catch (error) {
+      console.error(`❌ [${fnName}] Attempt ${attempt}/${maxAttempts} failed:`, error.message);
+      
+      if (attempt === maxAttempts) {
+        console.error(`💀 [${fnName}] MAX RETRIES REACHED`);
+        errorCount++;
+        
+        try {
+          await bot.sendMessage(ADMIN_CHAT_ID,
+            `❌ *ERRORE CRITICO*\n\nFunzione: ${fnName}\nErrore: ${error.message}\nTentativi: ${maxAttempts}\n\n⚠️ Controlla logs!`,
+            { parse_mode: 'Markdown' }
+          ).catch(() => {});
+        } catch {}
+        
+        throw error;
+      }
+      
+      const delay = RETRY_DELAY * Math.pow(2, attempt - 1);
+      console.log(`⏳ [${fnName}] Retry in ${delay/1000}s...`);
+      await new Promise(resolve => setTimeout(resolve, delay));
+    }
+  }
+}
+
+// ============================================
+// MONITORA SWAP USDC → $BOT (con auto-approve!)
 // ============================================
 async function checkPendingSwaps() {
-  try {
+  return retryWithBackoff(async () => {
     console.log('💱 Checking pending USDC → $BOT swaps...');
     
     const response = await axios.get(`${BASE44_API}/DepositRequest`, {
       headers: { 'api_key': BASE44_API_KEY, 'Content-Type': 'application/json' },
-      timeout: 10000
+      timeout: 15000
     });
 
     const requests = response.data;
@@ -56,51 +100,116 @@ async function checkPendingSwaps() {
     );
 
     if (pendingSwaps.length === 0) {
-      console.log('📭 No pending USDC → $BOT swaps');
+      console.log('📭 No pending swaps');
       return;
     }
 
-    console.log(`💱 Found ${pendingSwaps.length} pending USDC → $BOT swaps`);
+    console.log(`💱 Found ${pendingSwaps.length} pending swaps`);
 
     for (const swap of pendingSwaps) {
-      await sendSwapNotification(swap);
-      processedTransactions.add(`swap_${swap.id}`);
+      try {
+        if (AUTO_APPROVE_ENABLED && swap.amount <= AUTO_APPROVE_MAX_DEPOSIT_USDC) {
+          console.log(`✅ [AUTO] Swap ${swap.amount} USDC - Approving...`);
+          await autoApproveSwap(swap);
+        } else {
+          console.log(`⚠️ [MANUAL] Swap ${swap.amount} USDC - Notifying...`);
+          await sendSwapNotification(swap);
+        }
+        
+        processedTransactions.add(`swap_${swap.id}`);
+        successCount++;
+        
+      } catch (error) {
+        console.error(`❌ Error processing swap ${swap.id}:`, error.message);
+        errorCount++;
+      }
     }
 
+  }, 'checkPendingSwaps').catch(() => {
+    console.log('⚠️ checkPendingSwaps failed - will retry');
+  });
+}
+
+async function autoApproveSwap(swap) {
+  try {
+    const balanceResponse = await axios.get(`${BASE44_API}/TokenBalance`, {
+      headers: { 'api_key': BASE44_API_KEY },
+      timeout: 10000
+    });
+    
+    const balances = balanceResponse.data;
+    const userBalance = balances.find(b => b.user_email === swap.user_email);
+    
+    if (userBalance) {
+      await axios.put(
+        `${BASE44_API}/TokenBalance/${userBalance.id}`,
+        { 
+          balance: userBalance.balance + swap.bot_amount,
+          total_deposited: (userBalance.total_deposited || 0) + swap.bot_amount
+        },
+        { headers: { 'api_key': BASE44_API_KEY }, timeout: 10000 }
+      );
+    } else {
+      await axios.post(
+        `${BASE44_API}/TokenBalance`,
+        {
+          user_email: swap.user_email,
+          wallet_address: swap.wallet_address,
+          balance: 1000 + swap.bot_amount,
+          total_deposited: swap.bot_amount,
+          total_won: 0,
+          total_lost: 0,
+          total_bets: 0
+        },
+        { headers: { 'api_key': BASE44_API_KEY }, timeout: 10000 }
+      );
+    }
+    
+    await axios.put(
+      `${BASE44_API}/DepositRequest/${swap.id}`,
+      { 
+        status: 'approved',
+        processed: true,
+        admin_notes: `Auto-approved. ${swap.amount} USDC ≤ ${AUTO_APPROVE_MAX_DEPOSIT_USDC}. ${new Date().toISOString()}`
+      },
+      { headers: { 'api_key': BASE44_API_KEY }, timeout: 10000 }
+    );
+    
+    await bot.sendMessage(ADMIN_CHAT_ID,
+      `✅ *SWAP AUTO-APPROVATO* 🤖\n\n👤 ${swap.user_email}\n💵 ${swap.amount} USDC → 🤖 ${swap.bot_amount} $BOT\n⚡ Auto (≤ ${AUTO_APPROVE_MAX_DEPOSIT_USDC} USDC)`,
+      { parse_mode: 'Markdown' }
+    ).catch(() => {});
+    
+    console.log(`✅ [AUTO] Swap ${swap.id} completed`);
+    
   } catch (error) {
-    console.error('❌ Error checking swaps:', error.message);
+    console.error(`❌ [AUTO] Error:`, error.message);
+    await sendSwapNotification(swap);
+    throw error;
   }
 }
 
 async function sendSwapNotification(request) {
+  const limitNote = AUTO_APPROVE_ENABLED 
+    ? `\n\n⚠️ Sopra limite ${AUTO_APPROVE_MAX_DEPOSIT_USDC} USDC`
+    : '';
+  
   const message = 
-    `🔔 *SWAP USDC → $BOT* 💰\n\n` +
-    `👤 Utente: ${request.user_email}\n` +
-    `💵 USDC inviati: ${request.amount} USDC\n` +
-    `🤖 $BOT da accreditare: ${request.bot_amount} $BOT\n` +
-    `📊 Tasso: 1 USDC = ${request.exchange_rate} $BOT\n` +
-    `📍 Wallet: \`${request.wallet_address || 'N/A'}\`\n` +
-    `🆔 ID: ${request.id}\n\n` +
-    `⏰ ${new Date(request.created_date).toLocaleString('it-IT')}\n\n` +
-    `🔗 Verifica TX: \`${request.tx_hash}\``;
+    `🔔 *SWAP USDC → $BOT*${limitNote}\n\n👤 ${request.user_email}\n💵 ${request.amount} USDC\n🤖 ${request.bot_amount} $BOT\n🔗 TX: \`${request.tx_hash}\``;
 
   const keyboard = {
     inline_keyboard: [
       [
-        { text: '✅ Approva Swap', callback_data: `approveswap_${request.id}` },
+        { text: '✅ Approva', callback_data: `approveswap_${request.id}` },
         { text: '❌ Rifiuta', callback_data: `rejectswap_${request.id}` }
-      ],
-      [
-        { text: '🔍 Verifica TX su PolygonScan', url: `https://polygonscan.com/tx/${request.tx_hash}` }
       ]
     ]
   };
 
   try {
     await bot.sendMessage(ADMIN_CHAT_ID, message, { reply_markup: keyboard, parse_mode: 'Markdown' });
-    console.log(`✅ USDC → $BOT swap notification sent for ${request.user_email}`);
   } catch (error) {
-    console.error('❌ Error sending swap notification:', error.message);
+    console.error('❌ Error sending notification:', error.message);
   }
 }
 
@@ -108,12 +217,12 @@ async function sendSwapNotification(request) {
 // MONITORA SWAP $BOT → USDC
 // ============================================
 async function checkPendingReverseSwaps() {
-  try {
+  return retryWithBackoff(async () => {
     console.log('💸 Checking pending $BOT → USDC swaps...');
     
     const response = await axios.get(`${BASE44_API}/DepositRequest`, {
-      headers: { 'api_key': BASE44_API_KEY, 'Content-Type': 'application/json' },
-      timeout: 10000
+      headers: { 'api_key': BASE44_API_KEY },
+      timeout: 15000
     });
 
     const requests = response.data;
@@ -124,51 +233,82 @@ async function checkPendingReverseSwaps() {
     );
 
     if (pendingReverseSwaps.length === 0) {
-      console.log('📭 No pending $BOT → USDC swaps');
+      console.log('📭 No pending reverse swaps');
       return;
     }
 
-    console.log(`💸 Found ${pendingReverseSwaps.length} pending $BOT → USDC swaps`);
+    console.log(`💸 Found ${pendingReverseSwaps.length} pending reverse swaps`);
 
     for (const swap of pendingReverseSwaps) {
-      await sendReverseSwapNotification(swap);
-      processedTransactions.add(`swap_reverse_${swap.id}`);
+      try {
+        if (AUTO_APPROVE_ENABLED && swap.amount <= AUTO_APPROVE_MAX_WITHDRAW_BOT) {
+          console.log(`✅ [AUTO] Reverse ${swap.amount} $BOT - Approving...`);
+          await autoApproveReverseSwap(swap);
+        } else {
+          console.log(`⚠️ [MANUAL] Reverse ${swap.amount} $BOT - Notifying...`);
+          await sendReverseSwapNotification(swap);
+        }
+        
+        processedTransactions.add(`swap_reverse_${swap.id}`);
+        successCount++;
+        
+      } catch (error) {
+        console.error(`❌ Error processing reverse swap:`, error.message);
+        errorCount++;
+      }
     }
 
+  }, 'checkPendingReverseSwaps').catch(() => {
+    console.log('⚠️ checkPendingReverseSwaps failed');
+  });
+}
+
+async function autoApproveReverseSwap(swap) {
+  try {
+    await axios.put(
+      `${BASE44_API}/DepositRequest/${swap.id}`,
+      { 
+        status: 'approved',
+        admin_notes: `Auto-approved. ${swap.amount} $BOT ≤ ${AUTO_APPROVE_MAX_WITHDRAW_BOT}. ${new Date().toISOString()}`
+      },
+      { headers: { 'api_key': BASE44_API_KEY }, timeout: 10000 }
+    );
+    
+    await bot.sendMessage(ADMIN_CHAT_ID,
+      `✅ *REVERSE SWAP AUTO-APPROVATO* 🤖\n\n👤 ${swap.user_email}\n🤖 ${swap.amount} $BOT → 💵 ${swap.usdc_amount} USDC\n⚡ Auto (≤ ${AUTO_APPROVE_MAX_WITHDRAW_BOT} $BOT)`,
+      { parse_mode: 'Markdown' }
+    ).catch(() => {});
+    
+    console.log(`✅ [AUTO] Reverse swap approved`);
+    
   } catch (error) {
-    console.error('❌ Error checking reverse swaps:', error.message);
+    console.error(`❌ [AUTO] Error:`, error.message);
+    await sendReverseSwapNotification(swap);
+    throw error;
   }
 }
 
 async function sendReverseSwapNotification(request) {
+  const limitNote = AUTO_APPROVE_ENABLED
+    ? `\n\n⚠️ Sopra limite ${AUTO_APPROVE_MAX_WITHDRAW_BOT} $BOT`
+    : '';
+  
   const message = 
-    `🔔 *SWAP $BOT → USDC* 💸\n\n` +
-    `👤 Utente: ${request.user_email}\n` +
-    `🤖 $BOT venduti: ${request.amount} $BOT\n` +
-    `💵 USDC da inviare: ${request.usdc_amount} USDC\n` +
-    `📊 Tasso: 100 $BOT = 1 USDC\n` +
-    `📍 Wallet: \`${request.wallet_address || 'N/A'}\`\n` +
-    `🆔 ID: ${request.id}\n\n` +
-    `⏰ ${new Date(request.created_date).toLocaleString('it-IT')}\n\n` +
-    `💡 Balance utente GIÀ sottratto!`;
+    `🔔 *SWAP $BOT → USDC*${limitNote}\n\n👤 ${request.user_email}\n🤖 ${request.amount} $BOT\n💵 ${request.usdc_amount} USDC\n📍 \`${request.wallet_address}\``;
 
   const keyboard = {
     inline_keyboard: [
       [
-        { text: '✅ Approva & Invia USDC', callback_data: `approvereverseswap_${request.id}` },
-        { text: '❌ Rifiuta & Rimborsa', callback_data: `rejectreverseswap_${request.id}` }
-      ],
-      [
-        { text: '🔍 Verifica Wallet', url: `https://polygonscan.com/address/${request.wallet_address}` }
+        { text: '✅ Approva', callback_data: `approvereverseswap_${request.id}` },
+        { text: '❌ Rifiuta', callback_data: `rejectreverseswap_${request.id}` }
       ]
     ]
   };
 
   try {
     await bot.sendMessage(ADMIN_CHAT_ID, message, { reply_markup: keyboard, parse_mode: 'Markdown' });
-    console.log(`✅ $BOT → USDC swap notification sent for ${request.user_email}`);
   } catch (error) {
-    console.error('❌ Error sending reverse swap notification:', error.message);
+    console.error('❌ Error sending notification:', error.message);
   }
 }
 
@@ -176,15 +316,12 @@ async function sendReverseSwapNotification(request) {
 // PROCESSO AUTOMATICO SWAP $BOT → USDC
 // ============================================
 async function processReverseSwaps() {
-  try {
-    if (!ADMIN_PRIVATE_KEY) {
-      console.log('⚠️ ADMIN_PRIVATE_KEY non configurata - reverse swaps manuali');
-      return;
-    }
+  return retryWithBackoff(async () => {
+    if (!ADMIN_PRIVATE_KEY) return;
 
     const requestsResponse = await axios.get(`${BASE44_API}/DepositRequest`, {
       headers: { 'api_key': BASE44_API_KEY },
-      timeout: 10000
+      timeout: 15000
     });
 
     const requests = requestsResponse.data;
@@ -196,7 +333,7 @@ async function processReverseSwaps() {
 
     if (approvedReverseSwaps.length === 0) return;
 
-    console.log(`💸 [REVERSE SWAP] Trovate ${approvedReverseSwaps.length} richieste approvate`);
+    console.log(`💸 Processing ${approvedReverseSwaps.length} approved reverse swaps`);
 
     const provider = new ethers.JsonRpcProvider(POLYGON_RPC_URL);
     const adminWallet = new ethers.Wallet(ADMIN_PRIVATE_KEY, provider);
@@ -210,76 +347,55 @@ async function processReverseSwaps() {
 
     for (const req of approvedReverseSwaps) {
       try {
-        console.log(`📤 Invio ${req.usdc_amount} USDC a ${req.wallet_address}...`);
+        console.log(`📤 Sending ${req.usdc_amount} USDC to ${req.wallet_address}...`);
 
         const amountWei = ethers.parseUnits(req.usdc_amount.toString(), 6);
         const adminBalance = await usdcContract.balanceOf(adminWallet.address);
 
         if (adminBalance < amountWei) {
-          console.error(`❌ Saldo USDC vault insufficiente!`);
+          console.error(`❌ Insufficient USDC balance`);
           await bot.sendMessage(ADMIN_CHAT_ID,
-            `❌ *SALDO USDC VAULT INSUFFICIENTE*\n\n` +
-            `Richiesto: ${req.usdc_amount} USDC\n` +
-            `User: ${req.user_email}\n\n` +
-            `⚠️ Ricarica USDC nel vault!`,
+            `❌ *SALDO USDC INSUFFICIENTE*\n\nRichiesto: ${req.usdc_amount} USDC\nUser: ${req.user_email}`,
             { parse_mode: 'Markdown' }
-          );
+          ).catch(() => {});
           continue;
         }
 
         const tx = await usdcContract.transfer(req.wallet_address, amountWei);
-        console.log(`⏳ TX inviata: ${tx.hash}`);
+        console.log(`⏳ TX sent: ${tx.hash}`);
         
         await tx.wait();
-        console.log(`✅ TX confermata!`);
+        console.log(`✅ TX confirmed`);
 
         await axios.put(
           `${BASE44_API}/DepositRequest/${req.id}`,
           { processed: true, tx_hash: tx.hash, admin_notes: `Auto-processed. TX: ${tx.hash}` },
-          { headers: { 'api_key': BASE44_API_KEY }, timeout: 5000 }
+          { headers: { 'api_key': BASE44_API_KEY }, timeout: 10000 }
         );
 
         await bot.sendMessage(ADMIN_CHAT_ID,
-          `✅ *SWAP $BOT → USDC COMPLETATO*\n\n` +
-          `👤 User: ${req.user_email}\n` +
-          `💰 USDC inviati: ${req.usdc_amount} USDC\n` +
-          `🤖 $BOT bruciati: ${req.amount} $BOT\n` +
-          `📍 To: \`${req.wallet_address}\`\n` +
-          `🔗 [TX](https://polygonscan.com/tx/${tx.hash})`,
+          `✅ *SWAP COMPLETATO*\n\n👤 ${req.user_email}\n💰 ${req.usdc_amount} USDC inviati\n🔗 [TX](https://polygonscan.com/tx/${tx.hash})`,
           { parse_mode: 'Markdown', disable_web_page_preview: true }
-        );
+        ).catch(() => {});
 
-        console.log(`✅ [REVERSE SWAP] Completato per ${req.user_email}`);
+        successCount++;
 
       } catch (error) {
-        console.error(`❌ Errore reverse swap ${req.id}:`, error.message);
-        
-        await axios.put(
-          `${BASE44_API}/DepositRequest/${req.id}`,
-          { admin_notes: `Error: ${error.message}` },
-          { headers: { 'api_key': BASE44_API_KEY } }
-        );
-
-        await bot.sendMessage(ADMIN_CHAT_ID,
-          `❌ *ERRORE SWAP $BOT → USDC*\n\n` +
-          `User: ${req.user_email}\n` +
-          `Error: ${error.message}\n\n` +
-          `⚠️ Verifica manualmente!`,
-          { parse_mode: 'Markdown' }
-        );
+        console.error(`❌ Error processing reverse swap:`, error.message);
+        errorCount++;
       }
     }
 
-  } catch (error) {
-    console.error('❌ [REVERSE SWAP] Errore generale:', error.message);
-  }
+  }, 'processReverseSwaps').catch(() => {
+    console.log('⚠️ processReverseSwaps failed');
+  });
 }
 
 // ============================================
 // MONITORA DEPOSITI $BOT
 // ============================================
 async function checkVaultDeposits() {
-  try {
+  return retryWithBackoff(async () => {
     console.log('🔍 Checking vault deposits...');
     
     const response = await axios.get('https://api.polygonscan.com/api', {
@@ -293,7 +409,7 @@ async function checkVaultDeposits() {
         sort: 'desc',
         startblock: lastCheckedBlock > 0 ? lastCheckedBlock : 0
       },
-      timeout: 10000
+      timeout: 15000
     });
 
     if (response.data.status !== '1') {
@@ -301,7 +417,6 @@ async function checkVaultDeposits() {
         console.log('📭 No new transactions');
         return;
       }
-      console.log('⚠️ PolygonScan API response:', response.data.message);
       return;
     }
 
@@ -329,54 +444,36 @@ async function checkVaultDeposits() {
       return;
     }
 
-    console.log(`💰 Found ${incomingTxs.length} new incoming transactions`);
+    console.log(`💰 Found ${incomingTxs.length} new deposits`);
 
     for (const tx of incomingTxs) {
-      const senderAddress = tx.from;
-      const amount = parseFloat(tx.value) / 1e18;
-      const txHash = tx.hash;
-      const blockNumber = tx.blockNumber;
+      try {
+        const amount = parseFloat(tx.value) / 1e18;
+        const userEmail = await findUserByWallet(tx.from);
 
-      console.log(`\n💵 New deposit:`);
-      console.log(`   From: ${senderAddress}`);
-      console.log(`   Amount: ${amount} $BOT`);
-      console.log(`   TX: ${txHash.slice(0, 10)}...`);
+        if (userEmail) {
+          await processAutoDeposit(userEmail, tx.from, amount, tx.hash);
+          successCount++;
+        }
 
-      const userEmail = await findUserByWallet(senderAddress);
-
-      if (userEmail) {
-        console.log(`   ✅ User found: ${userEmail}`);
-        await processAutoDeposit(userEmail, senderAddress, amount, txHash);
-      } else {
-        console.log(`   ⚠️ Unknown wallet - notifying admin`);
-        await bot.sendMessage(ADMIN_CHAT_ID,
-          `⚠️ *DEPOSITO DA WALLET SCONOSCIUTO*\n\n` +
-          `💰 Importo: ${amount} $BOT\n` +
-          `📍 From: \`${senderAddress}\`\n` +
-          `📦 Block: ${blockNumber}\n` +
-          `🔗 [Verifica TX](https://polygonscan.com/tx/${txHash})\n\n` +
-          `❓ Wallet non associato - chiedi all'utente di collegarlo`,
-          { parse_mode: 'Markdown', disable_web_page_preview: true }
-        );
+        processedTransactions.add(tx.hash);
+        
+      } catch (error) {
+        console.error(`❌ Error processing deposit:`, error.message);
+        errorCount++;
       }
-
-      processedTransactions.add(txHash);
     }
 
-  } catch (error) {
-    if (error.code === 'ECONNABORTED') {
-      console.error('⏱️ Timeout checking vault - will retry');
-    } else {
-      console.error('❌ Error checking vault:', error.message);
-    }
-  }
+  }, 'checkVaultDeposits').catch(() => {
+    console.log('⚠️ checkVaultDeposits failed');
+  });
 }
 
 async function findUserByWallet(walletAddress) {
   try {
     const balanceResponse = await axios.get(`${BASE44_API}/TokenBalance`, {
-      headers: { 'api_key': BASE44_API_KEY, 'Content-Type': 'application/json' },
-      timeout: 5000
+      headers: { 'api_key': BASE44_API_KEY },
+      timeout: 10000
     });
 
     const balances = balanceResponse.data;
@@ -385,22 +482,7 @@ async function findUserByWallet(walletAddress) {
       b.wallet_address.toLowerCase() === walletAddress.toLowerCase()
     );
 
-    if (matchingBalance) {
-      return matchingBalance.user_email;
-    }
-
-    const requestResponse = await axios.get(`${BASE44_API}/DepositRequest`, {
-      headers: { 'api_key': BASE44_API_KEY, 'Content-Type': 'application/json' },
-      timeout: 5000
-    });
-
-    const requests = requestResponse.data;
-    const matchingRequest = requests.find(r => 
-      r.wallet_address && 
-      r.wallet_address.toLowerCase() === walletAddress.toLowerCase()
-    );
-
-    return matchingRequest ? matchingRequest.user_email : null;
+    return matchingBalance ? matchingBalance.user_email : null;
 
   } catch (error) {
     console.error('Error finding user:', error.message);
@@ -410,11 +492,9 @@ async function findUserByWallet(walletAddress) {
 
 async function processAutoDeposit(userEmail, walletAddress, amount, txHash) {
   try {
-    console.log(`   🔄 Processing auto-deposit for ${userEmail}`);
-
     const balanceResponse = await axios.get(`${BASE44_API}/TokenBalance`, {
-      headers: { 'api_key': BASE44_API_KEY, 'Content-Type': 'application/json' },
-      timeout: 5000
+      headers: { 'api_key': BASE44_API_KEY },
+      timeout: 10000
     });
 
     const balances = balanceResponse.data;
@@ -427,12 +507,8 @@ async function processAutoDeposit(userEmail, walletAddress, amount, txHash) {
           balance: userBalance.balance + amount,
           total_deposited: (userBalance.total_deposited || 0) + amount
         },
-        {
-          headers: { 'api_key': BASE44_API_KEY, 'Content-Type': 'application/json' },
-          timeout: 5000
-        }
+        { headers: { 'api_key': BASE44_API_KEY }, timeout: 10000 }
       );
-      console.log(`   💰 Balance updated: ${userBalance.balance} → ${userBalance.balance + amount}`);
     } else {
       await axios.post(
         `${BASE44_API}/TokenBalance`,
@@ -445,309 +521,53 @@ async function processAutoDeposit(userEmail, walletAddress, amount, txHash) {
           total_lost: 0,
           total_bets: 0
         },
-        {
-          headers: { 'api_key': BASE44_API_KEY, 'Content-Type': 'application/json' },
-          timeout: 5000
-        }
+        { headers: { 'api_key': BASE44_API_KEY }, timeout: 10000 }
       );
-      console.log(`   💰 New balance created: ${1000 + amount} $BOT`);
     }
 
-    await axios.post(
-      `${BASE44_API}/DepositRequest`,
-      {
-        user_email: userEmail,
-        wallet_address: walletAddress,
-        amount: amount,
-        status: 'approved',
-        request_type: 'deposit',
-        processed: true,
-        tx_hash: txHash,
-        admin_notes: `Auto-approved by blockchain listener - TX: ${txHash}`
-      },
-      {
-        headers: { 'api_key': BASE44_API_KEY, 'Content-Type': 'application/json' },
-        timeout: 5000
-      }
-    );
-
     await bot.sendMessage(ADMIN_CHAT_ID,
-      `✅ *DEPOSITO AUTO-APPROVATO*\n\n` +
-      `👤 Utente: ${userEmail}\n` +
-      `💰 Importo: ${amount} $BOT\n` +
-      `📍 Wallet: \`${walletAddress}\`\n` +
-      `🔗 [Verifica TX](https://polygonscan.com/tx/${txHash})\n\n` +
-      `✨ Saldo aggiornato automaticamente!`,
-      { parse_mode: 'Markdown', disable_web_page_preview: true }
-    );
+      `✅ *DEPOSITO AUTO-APPROVATO*\n\n👤 ${userEmail}\n💰 ${amount} $BOT`,
+      { parse_mode: 'Markdown' }
+    ).catch(() => {});
 
-    console.log(`   ✅ Auto-deposit completed!`);
     return true;
 
   } catch (error) {
-    console.error('   ❌ Error processing auto-deposit:', error.message);
-    
-    await bot.sendMessage(ADMIN_CHAT_ID,
-      `❌ *ERRORE AUTO-DEPOSITO*\n\n` +
-      `User: ${userEmail}\n` +
-      `Amount: ${amount} $BOT\n` +
-      `Error: ${error.message}\n\n` +
-      `⚠️ Approva manualmente!`,
-      { parse_mode: 'Markdown' }
-    ).catch(e => console.error('Failed to send error notification'));
-    
+    console.error('Error processing auto-deposit:', error.message);
     return false;
   }
 }
 
 // ============================================
-// CRON JOBS
+// HEALTH CHECK
 // ============================================
-async function createDailyPool() {
-  console.log('🎯 [CRON] Creazione pool giornaliero...');
+async function performHealthCheck() {
   try {
-    const now = new Date();
-    const closesAt = new Date(now.getTime() + 24 * 60 * 60 * 1000);
-    const response = await axios.post(
-      `${BASE44_API}/BettingMarket`,
-      {
-        title: "Chi sarà il protagonista del prossimo prompt?",
-        description: "Scommetti se il prossimo prompt pubblicato riguarderà un grande player (Tesla, Unitree) o uno sviluppatore medio-piccolo della community",
-        option_a: "Grande Player (Tesla, Unitree, Meta, ecc.)",
-        option_b: "Sviluppatore Medio-Piccolo / Community",
-        status: "active",
-        opens_at: now.toISOString(),
-        closes_at: closesAt.toISOString(),
-        total_back_a: 0,
-        total_lay_a: 0,
-        total_back_b: 0,
-        total_lay_b: 0
-      },
-      {
-        headers: { 'api_key': BASE44_API_KEY, 'Content-Type': 'application/json' },
-        timeout: 10000
-      }
-    );
-    console.log('✅ [CRON] Pool creato:', response.data.id);
-    await bot.sendMessage(ADMIN_CHAT_ID,
-      `🎯 *POOL GIORNALIERO CREATO*\n\n📅 Chiusura: ${closesAt.toLocaleString('it-IT')}\n⏰ Risoluzione automatica tra 24h`,
-      { parse_mode: 'Markdown' }
-    );
-    return response.data;
-  } catch (error) {
-    console.error('❌ [CRON] Errore creazione pool:', error.message);
-    await bot.sendMessage(ADMIN_CHAT_ID, `❌ Errore creazione pool: ${error.message}`);
-    throw error;
-  }
-}
-
-async function resolveAndPublish() {
-  console.log('🤖 [CRON] Risoluzione pool + pubblicazione...');
-  try {
-    const convoResponse = await axios.get(`${BASE44_API}/Conversation`, {
-      headers: { 'api_key': BASE44_API_KEY },
-      timeout: 10000
-    });
-    const conversations = convoResponse.data;
-    const last24h = new Date(Date.now() - 24 * 60 * 60 * 1000);
-    const recentConvos = conversations.filter(c => {
-      const convoDate = new Date(c.created_date);
-      return convoDate > last24h && (c.relevance_score >= 70 || c.practical_value >= 70);
-    });
-    if (recentConvos.length === 0) {
-      console.log('⚠️ Nessuna conversazione di qualità');
-      await bot.sendMessage(ADMIN_CHAT_ID, '⚠️ Nessuna conversazione nelle ultime 24h - pool non risolto');
-      return;
-    }
-    const bestConvo = recentConvos.sort((a, b) => 
-      Math.max(b.relevance_score, b.practical_value) - Math.max(a.relevance_score, a.practical_value)
-    )[0];
-    const industryCategories = ['tesla_optimus', 'unitree_robots', 'meta_ai', 'industry_news', 'breakthrough_tech'];
-    const winner = industryCategories.includes(bestConvo.category) ? 'A' : 'B';
-    console.log(`🏆 Best convo selected. Winner: Option ${winner}`);
-    const today = new Date().toISOString().split('T')[0];
-    await axios.post(
-      `${BASE44_API}/DailyHighlight`,
-      {
-        date: today,
-        conversation_id: bestConvo.id,
-        category: bestConvo.category,
-        difficulty_level: bestConvo.difficulty_level || "intermediate",
-        title: bestConvo.user_message.substring(0, 80),
-        summary: bestConvo.ai_response.substring(0, 200),
-        impact_score: Math.max(bestConvo.relevance_score, bestConvo.practical_value),
-        user_message: bestConvo.user_message,
-        ai_response: bestConvo.ai_response,
-        language: bestConvo.language || "it",
-        acceleration_days: 1,
-        practical_value: bestConvo.practical_value || 0,
-        actionable_steps: bestConvo.key_insights || []
-      },
-      { headers: { 'api_key': BASE44_API_KEY }, timeout: 10000 }
-    );
-    console.log('✅ Highlight pubblicato');
-    const marketsResponse = await axios.get(`${BASE44_API}/BettingMarket`, {
-      headers: { 'api_key': BASE44_API_KEY },
-      timeout: 10000
-    });
-    const markets = marketsResponse.data;
-    const activePool = markets.find(m => m.status === 'active' && m.title.includes("protagonista"));
-    if (!activePool) {
-      console.log('⚠️ Nessun pool attivo');
-      return;
-    }
-    const betsResponse = await axios.get(`${BASE44_API}/UserBet`, {
-      headers: { 'api_key': BASE44_API_KEY },
-      timeout: 10000
-    });
-    const allBets = betsResponse.data;
-    const marketBets = allBets.filter(b => b.market_id === activePool.id);
-    const winningBets = marketBets.filter(b => b.option === winner && b.bet_type === 'back');
-    const totalBackA = activePool.total_back_a || 0;
-    const totalBackB = activePool.total_back_b || 0;
-    const winningPool = winner === 'A' ? totalBackA : totalBackB;
-    const losingPool = winner === 'A' ? totalBackB : totalBackA;
-    let totalPaid = 0;
-    for (const bet of winningBets) {
-      const winShare = (bet.amount / winningPool) * losingPool;
-      const totalPayout = bet.amount + winShare;
-      await axios.put(
-        `${BASE44_API}/UserBet/${bet.id}`,
-        { status: "won", payout: totalPayout },
-        { headers: { 'api_key': BASE44_API_KEY }, timeout: 5000 }
-      );
-      const balances = (await axios.get(`${BASE44_API}/TokenBalance`, {
-        headers: { 'api_key': BASE44_API_KEY }
-      })).data;
-      const userBalance = balances.find(b => b.user_email === bet.user_email);
-      if (userBalance) {
-        await axios.put(
-          `${BASE44_API}/TokenBalance/${userBalance.id}`,
-          { balance: userBalance.balance + totalPayout, total_won: userBalance.total_won + winShare },
-          { headers: { 'api_key': BASE44_API_KEY }, timeout: 5000 }
-        );
-      }
-      totalPaid += winShare;
-    }
-    const losingBets = marketBets.filter(b => b.option !== winner || b.bet_type === 'lay');
-    for (const bet of losingBets) {
-      await axios.put(`${BASE44_API}/UserBet/${bet.id}`, { status: "lost" }, { headers: { 'api_key': BASE44_API_KEY }, timeout: 5000 });
-    }
-    await axios.put(
-      `${BASE44_API}/BettingMarket/${activePool.id}`,
-      { status: "resolved", winning_option: winner, resolved_at: new Date().toISOString() },
-      { headers: { 'api_key': BASE44_API_KEY }, timeout: 5000 }
-    );
-    console.log(`✅ Pool risolto! Vincitore: Opzione ${winner}`);
-    console.log(`💰 Pagati ${winningBets.length} vincitori (tot: ${totalPaid.toFixed(2)} $BOT)`);
-    await bot.sendMessage(ADMIN_CHAT_ID,
-      `✅ *POOL RISOLTO AUTOMATICAMENTE*\n\n🏆 Vincitore: Opzione ${winner}\n💰 Vincitori pagati: ${winningBets.length}\n💵 Totale distribuito: ${totalPaid.toFixed(2)} $BOT\n📊 Highlight pubblicato in timeline`,
-      { parse_mode: 'Markdown' }
-    );
-  } catch (error) {
-    console.error('❌ [CRON] Errore risoluzione:', error.message);
-    await bot.sendMessage(ADMIN_CHAT_ID, `❌ Errore risoluzione pool: ${error.message}`);
-  }
-}
-
-// ============================================
-// WITHDRAWALS
-// ============================================
-async function processWithdrawals() {
-  try {
-    if (!ADMIN_PRIVATE_KEY) {
-      console.log('⚠️ ADMIN_PRIVATE_KEY non configurata - withdrawals manuali');
-      return;
-    }
-    const requestsResponse = await axios.get(`${BASE44_API}/DepositRequest`, {
-      headers: { 'api_key': BASE44_API_KEY },
-      timeout: 10000
-    });
-    const requests = requestsResponse.data;
-    const pendingWithdrawals = requests.filter(r => r.request_type === 'withdrawal' && r.status === 'approved' && !r.processed);
-    if (pendingWithdrawals.length === 0) return;
-    console.log(`💸 [WITHDRAWAL] Trovate ${pendingWithdrawals.length} richieste`);
-    const provider = new ethers.JsonRpcProvider(POLYGON_RPC_URL);
-    const adminWallet = new ethers.Wallet(ADMIN_PRIVATE_KEY, provider);
-    const ERC20_ABI = ['function transfer(address to, uint256 amount) returns (bool)', 'function balanceOf(address owner) view returns (uint256)'];
-    const robotContract = new ethers.Contract(ROBOT_TOKEN_ADDRESS, ERC20_ABI, adminWallet);
-    for (const req of pendingWithdrawals) {
-      try {
-        console.log(`📤 Invio ${req.amount} $BOT a ${req.wallet_address}...`);
-        const amountWei = ethers.parseUnits(req.amount.toString(), 18);
-        const adminBalance = await robotContract.balanceOf(adminWallet.address);
-        if (adminBalance < amountWei) {
-          console.error(`❌ Saldo admin insufficiente!`);
-          await bot.sendMessage(ADMIN_CHAT_ID, `❌ *SALDO VAULT INSUFFICIENTE*\n\nRichiesto: ${req.amount} $BOT\nUser: ${req.user_email}`, { parse_mode: 'Markdown' });
-          continue;
-        }
-        const tx = await robotContract.transfer(req.wallet_address, amountWei);
-        console.log(`⏳ TX inviata: ${tx.hash}`);
-        await tx.wait();
-        console.log(`✅ TX confermata!`);
-        await axios.put(
-          `${BASE44_API}/DepositRequest/${req.id}`,
-          { processed: true, tx_hash: tx.hash, admin_notes: `Auto-processed. TX: ${tx.hash}` },
-          { headers: { 'api_key': BASE44_API_KEY }, timeout: 5000 }
-        );
+    const now = Date.now();
+    const uptimeMinutes = Math.floor((now - lastHealthCheck) / 60000);
+    
+    if (uptimeMinutes >= 60) {
+      console.log(`📊 Uptime: ${uptimeMinutes}m | Success: ${successCount} | Errors: ${errorCount}`);
+      
+      if (errorCount > 10) {
         await bot.sendMessage(ADMIN_CHAT_ID,
-          `✅ *PRELIEVO AUTOMATICO COMPLETATO*\n\n👤 User: ${req.user_email}\n💰 Amount: ${req.amount} $BOT\n📍 To: \`${req.wallet_address}\`\n🔗 [TX](https://polygonscan.com/tx/${tx.hash})`,
-          { parse_mode: 'Markdown', disable_web_page_preview: true }
-        );
-        console.log(`✅ [WITHDRAWAL] Completato per ${req.user_email}`);
-      } catch (error) {
-        console.error(`❌ Errore withdrawal ${req.id}:`, error.message);
-        await axios.put(`${BASE44_API}/DepositRequest/${req.id}`, { admin_notes: `Error: ${error.message}` }, { headers: { 'api_key': BASE44_API_KEY } });
+          `⚠️ *HEALTH ALERT*\n\nErrori: ${errorCount}\nSuccessi: ${successCount}\nUptime: ${uptimeMinutes}m`,
+          { parse_mode: 'Markdown' }
+        ).catch(() => {});
       }
+      
+      errorCount = 0;
+      successCount = 0;
+      lastHealthCheck = now;
     }
+    
   } catch (error) {
-    console.error('❌ [WITHDRAWAL] Errore generale:', error.message);
-  }
-}
-
-async function checkPendingWithdrawals() {
-  try {
-    const response = await axios.get(`${BASE44_API}/DepositRequest`, {
-      headers: { 'api_key': BASE44_API_KEY },
-      timeout: 5000
-    });
-    const requests = response.data;
-    const pendingWithdrawals = requests.filter(r => r.status === 'pending' && r.request_type === 'withdrawal' && !processedTransactions.has(`withdrawal_${r.id}`));
-    if (pendingWithdrawals.length > 0) {
-      console.log(`📋 Found ${pendingWithdrawals.length} pending withdrawals`);
-      for (const req of pendingWithdrawals) {
-        await sendWithdrawalNotification(req);
-        processedTransactions.add(`withdrawal_${req.id}`);
-      }
-    }
-  } catch (error) {
-    console.error('❌ Error checking withdrawals:', error.message);
-  }
-}
-
-async function sendWithdrawalNotification(request) {
-  const message = 
-    `🔔 *RICHIESTA PRELIEVO* ⬆️\n\n` +
-    `👤 Utente: ${request.user_email}\n` +
-    `💰 Importo: ${request.amount} $BOT\n` +
-    `📍 Wallet: \`${request.wallet_address || 'N/A'}\`\n` +
-    `🆔 ID: ${request.id}\n\n` +
-    `⏰ ${new Date(request.created_date).toLocaleString('it-IT')}`;
-  const keyboard = {
-    inline_keyboard: [[{ text: '✅ Approva', callback_data: `approve_${request.id}` }, { text: '❌ Rifiuta', callback_data: `reject_${request.id}` }]]
-  };
-  if (request.wallet_address) {
-    keyboard.inline_keyboard.push([{ text: '🔍 Verifica Wallet', url: `https://polygonscan.com/address/${request.wallet_address}` }]);
-  }
-  try {
-    await bot.sendMessage(ADMIN_CHAT_ID, message, { reply_markup: keyboard, parse_mode: 'Markdown' });
-  } catch (error) {
-    console.error('❌ Error sending notification:', error.message);
+    console.error('❌ Health check error:', error.message);
   }
 }
 
 // ============================================
-// CALLBACK BOTTONI TELEGRAM
+// CALLBACK BOTTONI
 // ============================================
 bot.on('callback_query', async (query) => {
   const data = query.data;
@@ -755,159 +575,87 @@ bot.on('callback_query', async (query) => {
   const action = parts[0];
   const requestId = parts.slice(1).join('_');
 
-  console.log(`🔘 Button clicked: ${action} for request ${requestId}`);
-
-  if (action === 'approveswap') {
-    const success = await approveSwap(requestId);
-    if (success) {
-      await bot.answerCallbackQuery(query.id, { text: '✅ Swap approvato!' });
-      await bot.editMessageText(query.message.text + '\n\n✅ *SWAP APPROVATO*', {
-        chat_id: ADMIN_CHAT_ID,
-        message_id: query.message.message_id,
-        parse_mode: 'Markdown'
-      });
-    } else {
-      await bot.answerCallbackQuery(query.id, { text: '❌ Errore!' });
+  try {
+    if (action === 'approveswap') {
+      await approveSwap(requestId);
+      await bot.answerCallbackQuery(query.id, { text: '✅ Approvato' }).catch(() => {});
+    } else if (action === 'rejectswap') {
+      await rejectRequest(requestId);
+      await bot.answerCallbackQuery(query.id, { text: '❌ Rifiutato' }).catch(() => {});
+    } else if (action === 'approvereverseswap') {
+      await approveReverseSwap(requestId);
+      await bot.answerCallbackQuery(query.id, { text: '✅ Approvato' }).catch(() => {});
+    } else if (action === 'rejectreverseswap') {
+      await rejectReverseSwap(requestId);
+      await bot.answerCallbackQuery(query.id, { text: '❌ Rifiutato' }).catch(() => {});
     }
-  } else if (action === 'rejectswap') {
-    const success = await rejectRequest(requestId);
-    if (success) {
-      await bot.answerCallbackQuery(query.id, { text: '❌ Rifiutato!' });
-      await bot.editMessageText(query.message.text + '\n\n❌ *RIFIUTATO*', {
-        chat_id: ADMIN_CHAT_ID,
-        message_id: query.message.message_id,
-        parse_mode: 'Markdown'
-      });
-    } else {
-      await bot.answerCallbackQuery(query.id, { text: '❌ Errore!' });
-    }
-  } else if (action === 'approvereverseswap') {
-    const success = await approveReverseSwap(requestId);
-    if (success) {
-      await bot.answerCallbackQuery(query.id, { text: '✅ Approvato!' });
-      await bot.editMessageText(query.message.text + '\n\n✅ *APPROVATO*', {
-        chat_id: ADMIN_CHAT_ID,
-        message_id: query.message.message_id,
-        parse_mode: 'Markdown'
-      });
-    } else {
-      await bot.answerCallbackQuery(query.id, { text: '❌ Errore!' });
-    }
-  } else if (action === 'rejectreverseswap') {
-    const success = await rejectReverseSwap(requestId);
-    if (success) {
-      await bot.answerCallbackQuery(query.id, { text: '❌ Rifiutato!' });
-      await bot.editMessageText(query.message.text + '\n\n❌ *RIFIUTATO*', {
-        chat_id: ADMIN_CHAT_ID,
-        message_id: query.message.message_id,
-        parse_mode: 'Markdown'
-      });
-    } else {
-      await bot.answerCallbackQuery(query.id, { text: '❌ Errore!' });
-    }
-  } else if (action === 'approve') {
-    const success = await approveWithdrawal(requestId);
-    if (success) {
-      await bot.answerCallbackQuery(query.id, { text: '✅ Approvato!' });
-      await bot.editMessageText(query.message.text + '\n\n✅ *APPROVATO*', {
-        chat_id: ADMIN_CHAT_ID,
-        message_id: query.message.message_id,
-        parse_mode: 'Markdown'
-      });
-    } else {
-      await bot.answerCallbackQuery(query.id, { text: '❌ Errore!' });
-    }
-  } else if (action === 'reject') {
-    const success = await rejectRequest(requestId);
-    if (success) {
-      await bot.answerCallbackQuery(query.id, { text: '❌ Rifiutato!' });
-      await bot.editMessageText(query.message.text + '\n\n❌ *RIFIUTATO*', {
-        chat_id: ADMIN_CHAT_ID,
-        message_id: query.message.message_id,
-        parse_mode: 'Markdown'
-      });
-    } else {
-      await bot.answerCallbackQuery(query.id, { text: '❌ Errore!' });
-    }
+  } catch (error) {
+    console.error('❌ Callback error:', error.message);
+    await bot.answerCallbackQuery(query.id, { text: '❌ Errore' }).catch(() => {});
   }
 });
 
 async function approveSwap(requestId) {
   try {
-    console.log(`⏳ Approving USDC → $BOT swap ${requestId}...`);
     const reqResponse = await axios.get(`${BASE44_API}/DepositRequest/${requestId}`, {
       headers: { 'api_key': BASE44_API_KEY },
-      timeout: 5000
+      timeout: 10000
     });
     const request = reqResponse.data;
+    
     const balanceResponse = await axios.get(`${BASE44_API}/TokenBalance`, {
       headers: { 'api_key': BASE44_API_KEY },
-      timeout: 5000
+      timeout: 10000
     });
     const balances = balanceResponse.data;
     const userBalance = balances.find(b => b.user_email === request.user_email);
+    
     if (userBalance) {
       await axios.put(
         `${BASE44_API}/TokenBalance/${userBalance.id}`,
-        { balance: userBalance.balance + request.bot_amount, total_deposited: (userBalance.total_deposited || 0) + request.bot_amount },
-        { headers: { 'api_key': BASE44_API_KEY }, timeout: 5000 }
-      );
-    } else {
-      await axios.post(
-        `${BASE44_API}/TokenBalance`,
-        {
-          user_email: request.user_email,
-          wallet_address: request.wallet_address,
-          balance: 1000 + request.bot_amount,
-          total_deposited: request.bot_amount,
-          total_won: 0,
-          total_lost: 0,
-          total_bets: 0
-        },
-        { headers: { 'api_key': BASE44_API_KEY }, timeout: 5000 }
+        { balance: userBalance.balance + request.bot_amount },
+        { headers: { 'api_key': BASE44_API_KEY }, timeout: 10000 }
       );
     }
+    
     await axios.put(
       `${BASE44_API}/DepositRequest/${requestId}`,
       { status: 'approved', processed: true },
-      { headers: { 'api_key': BASE44_API_KEY }, timeout: 5000 }
+      { headers: { 'api_key': BASE44_API_KEY }, timeout: 10000 }
     );
-    console.log(`✅ USDC → $BOT swap ${requestId} approved`);
+    
     return true;
   } catch (error) {
-    console.error('❌ Error approving swap:', error.message);
+    console.error('❌ Error approving:', error.message);
     return false;
   }
 }
 
 async function approveReverseSwap(requestId) {
   try {
-    console.log(`⏳ Approving $BOT → USDC swap ${requestId}...`);
     await axios.put(
       `${BASE44_API}/DepositRequest/${requestId}`,
       { status: 'approved' },
-      { headers: { 'api_key': BASE44_API_KEY }, timeout: 5000 }
+      { headers: { 'api_key': BASE44_API_KEY }, timeout: 10000 }
     );
-    console.log(`✅ $BOT → USDC swap ${requestId} approved`);
     return true;
   } catch (error) {
-    console.error('❌ Error approving reverse swap:', error.message);
+    console.error('❌ Error approving:', error.message);
     return false;
   }
 }
 
 async function rejectReverseSwap(requestId) {
   try {
-    console.log(`⏳ Rejecting $BOT → USDC swap ${requestId}...`);
     const reqResponse = await axios.get(`${BASE44_API}/DepositRequest/${requestId}`, {
       headers: { 'api_key': BASE44_API_KEY },
-      timeout: 5000
+      timeout: 10000
     });
     const request = reqResponse.data;
     
     const balanceResponse = await axios.get(`${BASE44_API}/TokenBalance`, {
       headers: { 'api_key': BASE44_API_KEY },
-      timeout: 5000
+      timeout: 10000
     });
     const balances = balanceResponse.data;
     const userBalance = balances.find(b => b.user_email === request.user_email);
@@ -916,64 +664,25 @@ async function rejectReverseSwap(requestId) {
       await axios.put(
         `${BASE44_API}/TokenBalance/${userBalance.id}`,
         { balance: userBalance.balance + request.amount },
-        { headers: { 'api_key': BASE44_API_KEY }, timeout: 5000 }
+        { headers: { 'api_key': BASE44_API_KEY }, timeout: 10000 }
       );
     }
     
     await axios.put(
       `${BASE44_API}/DepositRequest/${requestId}`,
-      { status: 'rejected', admin_notes: '$BOT refunded to user' },
-      { headers: { 'api_key': BASE44_API_KEY }, timeout: 5000 }
+      { status: 'rejected', admin_notes: '$BOT refunded' },
+      { headers: { 'api_key': BASE44_API_KEY }, timeout: 10000 }
     );
-    console.log(`❌ $BOT → USDC swap ${requestId} rejected`);
     return true;
   } catch (error) {
-    console.error('❌ Error rejecting reverse swap:', error.message);
-    return false;
-  }
-}
-
-async function approveWithdrawal(requestId) {
-  try {
-    console.log(`⏳ Approving withdrawal ${requestId}...`);
-    const reqResponse = await axios.get(`${BASE44_API}/DepositRequest/${requestId}`, {
-      headers: { 'api_key': BASE44_API_KEY },
-      timeout: 5000
-    });
-    const request = reqResponse.data;
-    const balanceResponse = await axios.get(`${BASE44_API}/TokenBalance`, {
-      headers: { 'api_key': BASE44_API_KEY },
-      timeout: 5000
-    });
-    const balances = balanceResponse.data;
-    const userBalance = balances.find(b => b.user_email === request.user_email);
-    if (!userBalance || userBalance.balance < request.amount) {
-      console.log('⚠️ Insufficient balance');
-      await bot.sendMessage(ADMIN_CHAT_ID, `⚠️ Balance insufficiente per ${request.user_email}!\nRichiesto: ${request.amount}\nDisponibile: ${userBalance?.balance || 0}`);
-      return false;
-    }
-    await axios.put(
-      `${BASE44_API}/TokenBalance/${userBalance.id}`,
-      { balance: userBalance.balance - request.amount },
-      { headers: { 'api_key': BASE44_API_KEY }, timeout: 5000 }
-    );
-    await axios.put(
-      `${BASE44_API}/DepositRequest/${requestId}`,
-      { status: 'approved' },
-      { headers: { 'api_key': BASE44_API_KEY }, timeout: 5000 }
-    );
-    console.log(`✅ Withdrawal ${requestId} approved`);
-    return true;
-  } catch (error) {
-    console.error('❌ Error approving withdrawal:', error.message);
+    console.error('❌ Error rejecting:', error.message);
     return false;
   }
 }
 
 async function rejectRequest(requestId) {
   try {
-    await axios.put(`${BASE44_API}/DepositRequest/${requestId}`, { status: 'rejected' }, { headers: { 'api_key': BASE44_API_KEY }, timeout: 5000 });
-    console.log(`❌ Request ${requestId} rejected`);
+    await axios.put(`${BASE44_API}/DepositRequest/${requestId}`, { status: 'rejected' }, { headers: { 'api_key': BASE44_API_KEY }, timeout: 10000 });
     return true;
   } catch (error) {
     console.error('❌ Error rejecting:', error.message);
@@ -985,125 +694,74 @@ async function rejectRequest(requestId) {
 // COMANDI TELEGRAM
 // ============================================
 bot.onText(/\/start/, async (msg) => {
-  const chatId = msg.chat.id;
-  await bot.sendMessage(chatId,
-    `🤖 *Bot Futuro Umanoide v2.2*\n\n✅ Bot attivo\n🏦 Vault monitored\n💱 USDC → $BOT\n💸 $BOT → USDC\n🎯 Cron jobs attivi\n💰 Withdrawals automatici\n\nComandi:\n/status - Info sistema\n/vault - Info vault\n/pools - Info betting`,
+  await bot.sendMessage(msg.chat.id,
+    `🤖 *Bot v3.0 Attivo*\n\n✅ Auto-approve: ${AUTO_APPROVE_ENABLED ? 'ON' : 'OFF'}\n💵 Max deposit: ${AUTO_APPROVE_MAX_DEPOSIT_USDC} USDC\n💸 Max withdraw: ${AUTO_APPROVE_MAX_WITHDRAW_BOT} $BOT`,
     { parse_mode: 'Markdown' }
-  );
+  ).catch(() => {});
 });
 
-bot.onText(/\/status/, async (msg) => {
-  const chatId = msg.chat.id;
-  if (chatId.toString() !== ADMIN_CHAT_ID) return;
-  const statusMessage = 
-    `📊 *STATUS SISTEMA v2.2*\n\n✅ Bot attivo\n✅ Depositi automatici\n✅ USDC → $BOT\n✅ $BOT → USDC\n✅ Withdrawal processor\n✅ Cron jobs attivi\n\n🏦 Vault: \`${VAULT_ADDRESS}\`\n💰 USDC: \`${USDC_CONTRACT}\`\n📋 TX cache: ${processedTransactions.size}\n📦 Last block: ${lastCheckedBlock}`;
-  await bot.sendMessage(chatId, statusMessage, { parse_mode: 'Markdown' });
-});
-
-bot.onText(/\/vault/, async (msg) => {
-  const chatId = msg.chat.id;
-  if (chatId.toString() !== ADMIN_CHAT_ID) return;
-  await bot.sendMessage(chatId, 
-    `🏦 *VAULT INFO*\n\n📍 Address: \`${VAULT_ADDRESS}\`\n💰 USDC: \`${USDC_CONTRACT}\`\n🤖 $BOT: \`${ROBOT_TOKEN_ADDRESS}\``,
+bot.onText(/\/health/, async (msg) => {
+  if (msg.chat.id.toString() !== ADMIN_CHAT_ID) return;
+  await bot.sendMessage(msg.chat.id,
+    `💚 *HEALTH*\n\n✅ Success: ${successCount}\n❌ Errors: ${errorCount}\n⏰ Uptime: ${Math.floor(process.uptime() / 60)}m`,
     { parse_mode: 'Markdown' }
-  );
-});
-
-bot.onText(/\/pools/, async (msg) => {
-  const chatId = msg.chat.id;
-  if (chatId.toString() !== ADMIN_CHAT_ID) return;
-  await bot.sendMessage(chatId, `🎯 *BETTING POOLS*\n\n⏰ Creazione: 00:00 UTC\n⏰ Risoluzione: 12:00 UTC`, { parse_mode: 'Markdown' });
+  ).catch(() => {});
 });
 
 // ============================================
-// HEALTH CHECK
+// HTTP SERVER
 // ============================================
 app.get('/', (req, res) => {
-  res.send('🤖 Futuro Umanoide Backend v2.2 - Active!');
+  res.send('🤖 Bot v3.0 Active!');
 });
 
 app.get('/health', (req, res) => {
   res.json({
     status: 'ok',
-    version: '2.2',
-    vault: VAULT_ADDRESS,
-    usdc: USDC_CONTRACT,
-    features: { 
-      telegram_bot: true, 
-      auto_deposits: true, 
-      usdc_to_bot: true,
-      bot_to_usdc: true,
-      auto_withdrawals: !!ADMIN_PRIVATE_KEY, 
-      cron_pools: true, 
-      cron_resolution: true 
-    },
-    processed_tx: processedTransactions.size,
-    last_block: lastCheckedBlock,
+    version: '3.0',
+    auto_approve: AUTO_APPROVE_ENABLED,
+    max_deposit: AUTO_APPROVE_MAX_DEPOSIT_USDC,
+    max_withdraw: AUTO_APPROVE_MAX_WITHDRAW_BOT,
+    success: successCount,
+    errors: errorCount,
     uptime: process.uptime()
   });
 });
-
-// ============================================
-// CRON SETUP
-// ============================================
-function setupCronJobs() {
-  console.log('⏰ Setting up cron jobs...');
-  cron.schedule('0 0 * * *', async () => { await createDailyPool(); });
-  cron.schedule('0 12 * * *', async () => { await resolveAndPublish(); });
-  console.log('✅ Cron jobs configurati');
-}
 
 // ============================================
 // AVVIO
 // ============================================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log('');
-  console.log('🚀 ================================');
-  console.log('🤖 FUTURO UMANOIDE BACKEND V2.2');
-  console.log('🚀 ================================');
-  console.log(`📡 HTTP Server: ${PORT}`);
-  console.log(`🏦 Vault: ${VAULT_ADDRESS}`);
-  console.log(`💰 USDC: ${USDC_CONTRACT}`);
-  console.log(`⏰ Check interval: ${CHECK_INTERVAL/1000}s`);
-  console.log(`💸 Auto-withdrawals: ${ADMIN_PRIVATE_KEY ? '✅' : '❌'}`);
-  console.log(`💸 Auto-reverse-swaps: ${ADMIN_PRIVATE_KEY ? '✅' : '❌'}`);
-  console.log('');
-  setupCronJobs();
+  console.log('🚀 Server started on port', PORT);
+  console.log('✅ Bot initialized');
   
   setInterval(checkVaultDeposits, CHECK_INTERVAL);
-  setInterval(checkPendingWithdrawals, CHECK_INTERVAL);
   setInterval(checkPendingSwaps, CHECK_INTERVAL);
   setInterval(checkPendingReverseSwaps, CHECK_INTERVAL);
-  setInterval(processWithdrawals, 60000);
   setInterval(processReverseSwaps, 60000);
+  setInterval(performHealthCheck, 5 * 60 * 1000);
   
   setTimeout(() => {
     checkVaultDeposits();
-    checkPendingWithdrawals();
     checkPendingSwaps();
     checkPendingReverseSwaps();
-    processWithdrawals();
     processReverseSwaps();
   }, 5000);
   
   bot.sendMessage(ADMIN_CHAT_ID, 
-    '🤖 *Backend v2.2 Avviato!*\n\n' +
-    '✅ USDC → $BOT\n' +
-    '✅ $BOT → USDC\n' +
-    '✅ Withdrawals automatici\n' +
-    '✅ Cron betting\n\n' +
-    'Sistema 100% automatico!', 
+    `🤖 *Bot v3.0 Avviato*\n\n✅ Auto-approve: ${AUTO_APPROVE_ENABLED ? 'ON' : 'OFF'}\n💵 Max: ${AUTO_APPROVE_MAX_DEPOSIT_USDC} USDC\n💸 Max: ${AUTO_APPROVE_MAX_WITHDRAW_BOT} $BOT`, 
     { parse_mode: 'Markdown' }
-  ).catch(err => console.log('⚠️ Start conversation with bot first'));
+  ).catch(() => {});
 });
 
 bot.on('polling_error', (error) => { 
-  console.error('❌ Polling error:', error.code); 
+  console.error('❌ Polling error:', error.code);
+  errorCount++;
 });
 
 process.on('SIGTERM', () => { 
-  console.log('👋 Shutting down...'); 
+  console.log('👋 Shutdown'); 
   bot.stopPolling(); 
   process.exit(0); 
 });
